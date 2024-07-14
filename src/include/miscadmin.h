@@ -306,6 +306,9 @@ extern void InitStandaloneProcess(const char *argv0);
 extern void SwitchToSharedLatch(void);
 extern void SwitchBackToLocalLatch(void);
 
+extern void
+InitPostmasterChild_Thread(void);
+
 typedef enum BackendType
 {
 	B_INVALID = 0,

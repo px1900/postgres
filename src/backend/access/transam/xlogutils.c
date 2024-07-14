@@ -30,6 +30,39 @@
 #include "utils/hsearch.h"
 #include "utils/rel.h"
 
+#define RPC_REMOTE_DISK
+
+#ifdef RPC_REMOTE_DISK
+
+//#define PathNameOpenFile(_Path, _Flag) RpcPathNameOpenFile(_Path, _Flag)
+#define OpenTransientFile(_Path, _Flag) OpenTransientFile_Rpc_Local(_Path, _Flag)
+#define CloseTransientFile(_Fd) CloseTransientFile_Rpc_Local(_Fd)
+//#define FileWrite(_File, _buffer, _amount, _offset, _wait_event_info) RpcFileWrite(_File, _buffer, _amount, _offset, _wait_event_info)
+//#define FilePrefetch(_File, _offset, _amount, _flag) RpcFilePrefetch(_File, _offset, _amount, _flag)
+//#define FileWriteback(_File, _offset, _nbytes, _flag) RpcFileWriteback(_File, _offset, _nbytes, _flag)
+//#define FileClose(_File) RpcFileClose(_File)
+//#define FileRead(_file, _buffer, _amount, _offset, _flag) RpcFileRead(_buffer, _file, _offset)
+//#define FileTruncate(_file, _size, _flag) RpcFileTruncate(_file, _size)
+//#define FileSync(_file, _flag) RpcFileSync(_file, _flag)
+//#define pg_pread(_fd, p, _amount, _offset) RpcPgPRead(_fd, p, _amount, _offset)
+//#define pg_pwrite(_fd, p, _amount, _offset) RpcPgPWrite(_fd, p, _amount, _offset)
+//#define BasicOpenFile(_path, _flags) RpcBasicOpenFile(_path, _flags)
+#define BasicOpenFile(_path, _flags) BasicOpenFile_Rpc_Local(_path, _flags)
+//#define FileSize(_file) RpcFileSize(_file)
+//#define FilePathName(_file) RpcFilePathName(_file)
+//#define TablespaceCreateDbspace(_spc, _db, _isRedo) RpcTablespaceCreateDbspace(_spc, _db, _isRedo)
+#define unlink(_path) Unlink_Rpc_Local(_path)
+//#define ftruncate(_fd, _size) RpcFtruncate(_fd, _size)
+#define close(_fd) close_rpc_local(_fd)
+
+#define pg_fdatasync(_fd) pg_fdatasync_rpc_local(_fd)
+#define pg_fsync_no_writethrough(_fd) pg_fsync_no_writethrough_rpc_local(_fd)
+
+#define pg_fsync(_fd) pg_fsync_rpc_local(_fd)
+//#define stat(_path, _stat) stat_rpc_local(_path, _stat)
+#define durable_unlink(_fname, _flag) durable_unlink_rpc_local(_fname, _flag)
+#define durable_rename_excl(_old, _new, _elevel) durable_rename_excl_rpc_local(_old, _new, _elevel)
+#endif
 
 /* GUC variable */
 bool		ignore_invalid_pages = false;
@@ -305,6 +338,10 @@ XLogReadBufferForRedo(XLogReaderState *record, uint8 block_id,
 Buffer
 XLogInitBufferForRedo(XLogReaderState *record, uint8 block_id)
 {
+#ifdef ENABLE_DEBUG_INFO
+    printf("%s %d start, block_id = %d\n", __func__ , __LINE__, block_id);
+    fflush(stdout);
+#endif
 	Buffer		buf;
 
 	XLogReadBufferForRedoExtended(record, block_id, RBM_ZERO_AND_LOCK, false,
@@ -333,6 +370,10 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 							  ReadBufferMode mode, bool get_cleanup_lock,
 							  Buffer *buf)
 {
+#ifdef ENABLE_DEBUG_INFO
+    printf("%s %d\n", __func__ , __LINE__);
+    fflush(stdout);
+#endif
 	XLogRecPtr	lsn = record->EndRecPtr;
 	RelFileNode rnode;
 	ForkNumber	forknum;
@@ -358,9 +399,17 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	if (!willinit && zeromode)
 		elog(PANIC, "block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record");
 
+#ifdef ENABLE_DEBUG_INFO
+    printf("%s %d\n", __func__ , __LINE__);
+    fflush(stdout);
+#endif
 	/* If it has a full-page image and it should be restored, do it. */
 	if (XLogRecBlockImageApply(record, block_id))
 	{
+#ifdef ENABLE_DEBUG_INFO
+        printf("%s %d 2\n", __func__ , __LINE__);
+        fflush(stdout);
+#endif
 		Assert(XLogRecHasBlockImage(record, block_id));
 		*buf = XLogReadBufferExtended(rnode, forknum, blkno,
 									  get_cleanup_lock ? RBM_ZERO_AND_CLEANUP_LOCK : RBM_ZERO_AND_LOCK);
@@ -374,10 +423,18 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		 */
 		if (!PageIsNew(page))
 		{
+#ifdef ENABLE_DEBUG_INFO
+            printf("%s %d, lsn = %lu\n", __func__ , __LINE__, lsn);
+            fflush(stdout);
+#endif
 			PageSetLSN(page, lsn);
 		}
+#ifdef ENABLE_DEBUG_INFO
+        printf("%s %d, after redo lsn = %lu\n", __func__ , __LINE__, lsn);
+        fflush(stdout);
+#endif
 
-		MarkBufferDirty(*buf);
+        MarkBufferDirty(*buf);
 
 		/*
 		 * At the end of crash recovery the init forks of unlogged relations
@@ -392,9 +449,21 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	}
 	else
 	{
+#ifdef ENABLE_DEBUG_INFO
+        printf("%s %d\n", __func__ , __LINE__);
+        fflush(stdout);
+#endif
 		*buf = XLogReadBufferExtended(rnode, forknum, blkno, mode);
+#ifdef ENABLE_DEBUG_INFO
+        printf("%s %d\n", __func__ , __LINE__);
+        fflush(stdout);
+#endif
 		if (BufferIsValid(*buf))
 		{
+#ifdef ENABLE_DEBUG_INFO
+            printf("%s %d\n", __func__ , __LINE__);
+            fflush(stdout);
+#endif
 			if (mode != RBM_ZERO_AND_LOCK && mode != RBM_ZERO_AND_CLEANUP_LOCK)
 			{
 				if (get_cleanup_lock)
@@ -402,6 +471,10 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 				else
 					LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
 			}
+#ifdef ENABLE_DEBUG_INFO
+            printf("%s %d, origLsn = %lu, record_lsn = %lu\n", __func__ , __LINE__, PageGetLSN(BufferGetPage(*buf)), lsn);
+            fflush(stdout);
+#endif
 			if (lsn <= PageGetLSN(BufferGetPage(*buf)))
 				return BLK_DONE;
 			else
@@ -410,6 +483,10 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		else
 			return BLK_NOTFOUND;
 	}
+#ifdef ENABLE_DEBUG_INFO
+    printf("%s %d\n", __func__ , __LINE__);
+    fflush(stdout);
+#endif
 }
 
 /*
@@ -442,7 +519,11 @@ Buffer
 XLogReadBufferExtended(RelFileNode rnode, ForkNumber forknum,
 					   BlockNumber blkno, ReadBufferMode mode)
 {
-	BlockNumber lastblock;
+#ifdef ENABLE_DEBUG_INFO
+    printf("%s %d\n", __func__ , __LINE__);
+    fflush(stdout);
+#endif
+    BlockNumber lastblock;
 	Buffer		buffer;
 	SMgrRelation smgr;
 
@@ -462,15 +543,27 @@ XLogReadBufferExtended(RelFileNode rnode, ForkNumber forknum,
 	smgrcreate(smgr, forknum, true);
 
 	lastblock = smgrnblocks(smgr, forknum);
+#ifdef ENABLE_DEBUG_INFO
+    printf("%s %d, mdnblock=%u, target=%u\n", __func__ , __LINE__, lastblock, blkno);
+    fflush(stdout);
+#endif
 
-	if (blkno < lastblock)
+    if (blkno < lastblock)
 	{
+#ifdef ENABLE_DEBUG_INFO
+        printf("%s %d, start find page in buffer, mdnblock=%u, target=%u\n", __func__ , __LINE__, lastblock, blkno);
+        fflush(stdout);
+#endif
 		/* page exists in file */
 		buffer = ReadBufferWithoutRelcache(rnode, forknum, blkno,
 										   mode, NULL);
 	}
 	else
 	{
+#ifdef ENABLE_DEBUG_INFO
+        printf("%s %d, didn't find page in buffer\n", __func__ , __LINE__);
+        fflush(stdout);
+#endif
 		/* hm, page doesn't exist in file */
 		if (mode == RBM_NORMAL)
 		{
@@ -523,6 +616,10 @@ XLogReadBufferExtended(RelFileNode rnode, ForkNumber forknum,
 			return InvalidBuffer;
 		}
 	}
+    uint64_t lsn = PageGetLSN((Page) BufferGetPage(buffer));
+#ifdef ENABLE_DEBUG_INFO
+    printf("%s %d, find page with lsn = %lu\n", __func__ , __LINE__, lsn);
+#endif
 
 	return buffer;
 }
@@ -795,6 +892,9 @@ wal_segment_open(XLogReaderState *state, XLogSegNo nextSegNo,
 	state->seg.ws_file = BasicOpenFile(path, O_RDONLY | PG_BINARY);
 	if (state->seg.ws_file >= 0)
 		return;
+
+    printf("%s %d\n", __func__ , __LINE__);
+    fflush(stdout);
 
 	if (errno == ENOENT)
 		ereport(ERROR,

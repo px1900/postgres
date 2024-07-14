@@ -53,6 +53,7 @@
 #include "utils/rel.h"
 #include "utils/resowner_private.h"
 #include "utils/timestamp.h"
+#include "storage/rpcclient.h"
 
 
 /* Note: these two macros only work on shared buffers, not local ones! */
@@ -77,6 +78,8 @@ typedef struct PrivateRefCountEntry
 
 /* 64 bytes, about the size of a cache line on common systems */
 #define REFCOUNT_ARRAY_ENTRIES 8
+
+extern int IsRpcClient;
 
 /*
  * Status of buffers to checkpoint for a particular tablespace, used
@@ -448,10 +451,6 @@ ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref)
 )
 
 
-static Buffer ReadBuffer_common(SMgrRelation reln, char relpersistence,
-								ForkNumber forkNum, BlockNumber blockNum,
-								ReadBufferMode mode, BufferAccessStrategy strategy,
-								bool *hit);
 static bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy);
 static void PinBuffer_Locked(BufferDesc *buf);
 static void UnpinBuffer(BufferDesc *buf, bool fixOwner);
@@ -711,7 +710,7 @@ ReadBufferWithoutRelcache(RelFileNode rnode, ForkNumber forkNum,
  *
  * *hit is set to true if the request was satisfied from shared buffer cache.
  */
-static Buffer
+Buffer
 ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 				  BlockNumber blockNum, ReadBufferMode mode,
 				  BufferAccessStrategy strategy, bool *hit)
@@ -727,7 +726,7 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	/* Make sure we will have room to remember the buffer pin */
 	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
 
-	isExtend = (blockNum == P_NEW);
+    isExtend = (blockNum == P_NEW);
 
 	TRACE_POSTGRESQL_BUFFER_READ_START(forkNum, blockNum,
 									   smgr->smgr_rnode.node.spcNode,
@@ -905,7 +904,10 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 			if (track_io_timing)
 				INSTR_TIME_SET_CURRENT(io_start);
 
-			smgrread(smgr, forkNum, blockNum, (char *) bufBlock);
+			if(IsRpcClient)
+                RpcReadBuffer_common((char*)bufBlock, smgr, relpersistence, forkNum, blockNum, mode);
+			else
+			    smgrread(smgr, forkNum, blockNum, (char *) bufBlock);
 
 			if (track_io_timing)
 			{
@@ -982,6 +984,99 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	return BufferDescriptorGetBuffer(bufHdr);
 }
 
+// Try to find this buffer in buffer pool.
+// If found, lock the buffer content with EXCLUSIVE lock
+// Else, return $InvalidBuffer
+Buffer
+FindPageInBuffer(RelFileNode rnode, ForkNumber forkNumber, BlockNumber blockNumber) {
+    BufferTag bufferTag;
+    uint32		newHash;		/* hash value for newTag */
+    LWLock	   *newPartitionLock;	/* buffer partition lock for it */
+    int			buf_id;
+    BufferDesc *buf;
+
+    ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
+
+    /* create a tag so we can lookup the buffer */
+    INIT_BUFFERTAG(bufferTag, rnode, forkNumber, blockNumber);
+
+    /* determine its hash code and partition lock ID */
+    newHash = BufTableHashCode(&bufferTag);
+    newPartitionLock = BufMappingPartitionLock(newHash);
+
+    /* see if the block is in the buffer pool already */
+    LWLockAcquire(newPartitionLock, LW_SHARED);
+    buf_id = BufTableLookup(&bufferTag, newHash);
+
+    if (buf_id >= 0) {
+#ifdef ENABLE_DEBUG_INFO
+        printf("%s %d\n", __func__ , __LINE__);
+        fflush(stdout);
+#endif
+        /*
+		 * Found it.  Now, pin the buffer so no one can steal it from the
+		 * buffer pool, and check to see if the correct data has been loaded
+		 * into the buffer.
+		 */
+        buf = GetBufferDescriptor(buf_id);
+#ifdef ENABLE_DEBUG_INFO
+        printf("%s %d\n", __func__ , __LINE__);
+        fflush(stdout);
+#endif
+
+        bool valid = PinBuffer(buf, NULL);
+#ifdef ENABLE_DEBUG_INFO
+        printf("%s %d\n", __func__ , __LINE__);
+        fflush(stdout);
+#endif
+
+        /* Can release the mapping lock as soon as we've pinned it */
+        LWLockRelease(newPartitionLock);
+
+#ifdef ENABLE_DEBUG_INFO
+        printf("%s %d\n", __func__ , __LINE__);
+        fflush(stdout);
+#endif
+
+        if (!valid)
+        {
+
+#ifdef ENABLE_DEBUG_INFO
+            printf("%s %d\n", __func__ , __LINE__);
+            fflush(stdout);
+#endif
+            /*
+             * We can only get here if (a) someone else is still reading in
+             * the page, or (b) a previous read attempt failed.  We have to
+             * wait for any active read attempt to finish, and then set up our
+             * own read attempt if the page is still not BM_VALID.
+             * StartBufferIO does it all.
+             */
+            if (StartBufferIO(buf, true))
+            {
+                /*
+                 * If we get here, previous attempts to read the buffer must
+                 * have failed ... but we shall bravely try again.
+                 */
+                return InvalidBuffer;
+            }
+        }
+
+        // Now exclusively lock the content
+//        LWLockAcquire(BufferDescriptorGetContentLock(buf),
+//                      LW_EXCLUSIVE);
+
+#ifdef ENABLE_DEBUG_INFO
+        printf("%s %d\n", __func__ , __LINE__);
+        fflush(stdout);
+#endif
+        return BufferDescriptorGetBuffer(buf);
+    }
+
+    LWLockRelease(newPartitionLock);
+    return InvalidBuffer;
+}
+
 /*
  * BufferAlloc -- subroutine for ReadBuffer.  Handles lookup of a shared
  *		buffer.  If no buffer exists already, selects a replacement
@@ -1007,6 +1102,9 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 			BufferAccessStrategy strategy,
 			bool *foundPtr)
 {
+//    printf("%s    Start2, spc=%u, db=%u, rel=%u, forkNum=%d, blk=%u\n", __func__, smgr->smgr_rnode.node.spcNode,
+//           smgr->smgr_rnode.node.dbNode, smgr->smgr_rnode.node.relNode, forkNum, blockNum);
+//    fflush(stdout);
 	BufferTag	newTag;			/* identity of requested block */
 	uint32		newHash;		/* hash value for newTag */
 	LWLock	   *newPartitionLock;	/* buffer partition lock for it */
@@ -1588,6 +1686,9 @@ ReleaseAndReadBuffer(Buffer buffer,
 static bool
 PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 {
+//    printf("%s starts, spc = %ld, db = %ld, rel = %ld\n", __func__ , buf->tag.rnode.spcNode,
+//           buf->tag.rnode.dbNode, buf->tag.rnode.relNode);
+//    fflush(stdout);
 	Buffer		b = BufferDescriptorGetBuffer(buf);
 	bool		result;
 	PrivateRefCountEntry *ref;
@@ -1673,6 +1774,9 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 static void
 PinBuffer_Locked(BufferDesc *buf)
 {
+//    printf("%s starts, spc = %ld, db = %ld, rel = %ld\n", __func__ , buf->tag.rnode.spcNode,
+//           buf->tag.rnode.dbNode, buf->tag.rnode.relNode);
+//    fflush(stdout);
 	Buffer		b;
 	PrivateRefCountEntry *ref;
 	uint32		buf_state;
@@ -1711,6 +1815,9 @@ PinBuffer_Locked(BufferDesc *buf)
 static void
 UnpinBuffer(BufferDesc *buf, bool fixOwner)
 {
+//    printf("%s starts, spc = %ld, db = %ld, rel = %ld\n", __func__ , buf->tag.rnode.spcNode,
+//           buf->tag.rnode.dbNode, buf->tag.rnode.relNode);
+//    fflush(stdout);
 	PrivateRefCountEntry *ref;
 	Buffer		b = BufferDescriptorGetBuffer(buf);
 
@@ -1718,8 +1825,9 @@ UnpinBuffer(BufferDesc *buf, bool fixOwner)
 	ref = GetPrivateRefCountEntry(b, false);
 	Assert(ref != NULL);
 
-	if (fixOwner)
-		ResourceOwnerForgetBuffer(CurrentResourceOwner, b);
+	if (fixOwner) {
+        ResourceOwnerForgetBuffer(CurrentResourceOwner, b);
+    }
 
 	Assert(ref->refcount > 0);
 	ref->refcount--;
@@ -4289,6 +4397,9 @@ rnode_comparator(const void *p1, const void *p2)
 uint32
 LockBufHdr(BufferDesc *desc)
 {
+//	printf("pid = %d, %s starts, spc = %ld, db = %ld, rel = %ld\n", getpid(),__func__ , desc->tag.rnode.spcNode,
+//		   desc->tag.rnode.dbNode, desc->tag.rnode.relNode);
+//	fflush(stdout);
 	SpinDelayStatus delayStatus;
 	uint32		old_buf_state;
 
