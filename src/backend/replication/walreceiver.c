@@ -78,7 +78,13 @@
 #include "utils/ps_status.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
+#include "tcop/storage_server.h"
 
+#include <pthread.h>
+
+#define RPC_REMOTE_DISK
+
+extern pthread_t WalRcvTid;
 
 /*
  * GUC variables.  (Other variables that affect walreceiver are in xlog.c
@@ -139,6 +145,7 @@ static void ProcessWalSndrMessage(XLogRecPtr walEnd, TimestampTz sendTime);
 static void WalRcvSigHupHandler(SIGNAL_ARGS);
 static void WalRcvShutdownHandler(SIGNAL_ARGS);
 
+extern int IsRpcServer;
 
 /*
  * Process any interrupts the walreceiver process may have received.
@@ -172,11 +179,24 @@ ProcessWalRcvInterrupts(void)
 	}
 }
 
+void StartWalRcvThread(void) {
+    if(WalRcvTid != 0) {
+        return;
+    }
+    if( 0 != pthread_create(&WalRcvTid, NULL, (void*)WalReceiverMain, NULL) ) {
+        printf("[%s] WalReceiverMain start failed\n", __func__ );
+        return;
+    }
+
+    return;
+}
 
 /* Main entry point for walreceiver process */
 void
 WalReceiverMain(void)
 {
+//    printf("%s Start \n", __func__ );
+//    fflush(stdout);
 	char		conninfo[MAXCONNINFO];
 	char	   *tmp_conninfo;
 	char		slotname[NAMEDATALEN];
@@ -403,7 +423,8 @@ WalReceiverMain(void)
 		ThisTimeLineID = startpointTLI;
 		if (walrcv_startstreaming(wrconn, &options))
 		{
-			if (first_stream)
+//            printf("%s get into for loop\n", __func__ );
+            if (first_stream)
 				ereport(LOG,
 						(errmsg("started streaming WAL from primary at %X/%X on timeline %u",
 								(uint32) (startpoint >> 32), (uint32) startpoint,
@@ -631,11 +652,11 @@ WalReceiverMain(void)
 			else
 				XLogArchiveNotify(xlogfname);
 		}
-		recvFile = -1;
+        recvFile = -1;
 
 		elog(DEBUG1, "walreceiver ended streaming and awaits new instructions");
 		WalRcvWaitForStartPosition(&startpoint, &startpointTLI);
-	}
+    }
 	/* not reached */
 }
 
@@ -856,6 +877,8 @@ XLogWalRcvProcessMsg(unsigned char type, char *buf, Size len)
 
 				buf += hdrlen;
 				len -= hdrlen;
+//                printf("%s received a xlog, starts from %lu, len = %lu\n", __func__ , dataStart, len);
+//                fflush(stdout);
 				XLogWalRcvWrite(buf, len, dataStart);
 				break;
 			}
@@ -902,7 +925,12 @@ XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr)
 	{
 		int			segbytes;
 
-		if (recvFile < 0 || !XLByteInSeg(recptr, recvSegNo, wal_segment_size))
+        // storage node's receiver do nothing
+#ifdef RPC_REMOTE_DISK
+		if ((!IsRpcServer) && ( recvFile < 0 || !XLByteInSeg(recptr, recvSegNo, wal_segment_size)) )
+#else
+            if (recvFile < 0 || !XLByteInSeg(recptr, recvSegNo, wal_segment_size))
+#endif
 		{
 			bool		use_existent;
 
@@ -957,8 +985,11 @@ XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr)
 
 		/* OK to write the logs */
 		errno = 0;
-
-		byteswritten = pg_pwrite(recvFile, buf, segbytes, (off_t) startoff);
+#ifdef RPC_REMOTE_DISK
+        byteswritten = segbytes;
+#else
+        byteswritten = pg_pwrite(recvFile, buf, segbytes, (off_t) startoff);
+#endif
 		if (byteswritten <= 0)
 		{
 			char		xlogfname[MAXFNAMELEN];
@@ -1004,7 +1035,13 @@ XLogWalRcvFlush(bool dying)
 	{
 		WalRcvData *walrcv = WalRcv;
 
-		issue_xlog_fsync(recvFile, recvSegNo);
+#ifdef RPC_REMOTE_DISK
+        if(!IsRpcServer)
+            issue_xlog_fsync(recvFile, recvSegNo);
+#else
+        issue_xlog_fsync(recvFile, recvSegNo);
+#endif
+
 
 		LogstreamResult.Flush = LogstreamResult.Write;
 

@@ -16,6 +16,7 @@
 #include "access/xlogreader.h"
 #include "lib/stringinfo.h"
 #include "storage/off.h"
+#include "storage/bufpage.h"
 
 /*
  * XLOG records for btree operations
@@ -331,5 +332,7 @@ extern const char *btree_identify(uint8 info);
 extern void btree_xlog_startup(void);
 extern void btree_xlog_cleanup(void);
 extern void btree_mask(char *pagedata, BlockNumber blkno);
+
+extern void _bt_restore_page(Page page, char *from, int len);
 
 #endif							/* NBTXLOG_H */

@@ -95,6 +95,7 @@ static char *hdr_scratch = NULL;
 	 MaxSizeOfXLogRecordBlockHeader * (XLR_MAX_BLOCK_ID + 1) + \
 	 SizeOfXLogRecordDataHeaderLong + SizeOfXlogOrigin)
 
+#define DISABLE_TORN_PAGE_WRITE_PROTECT
 /*
  * An array of XLogRecData structs, to hold registered data.
  */
@@ -440,6 +441,10 @@ XLogInsert(RmgrId rmid, uint8 info)
 	{
 		XLogResetInsertion();
 		EndPos = SizeOfXLogLongPHD; /* start of 1st chkpt record */
+//        const char*id=NULL;
+//        id = RmgrTable[rmid].rm_identify( info );
+//        printf("%s %d, RM= %s, End lsn = %lu, id = %s\n", __func__, __LINE__, RmgrTable[rmid].rm_name, EndPos, id);
+//        fflush(stdout);
 		return EndPos;
 	}
 
@@ -466,7 +471,12 @@ XLogInsert(RmgrId rmid, uint8 info)
 
 	XLogResetInsertion();
 
-	return EndPos;
+//    const char*id=NULL;
+//    id = RmgrTable[rmid].rm_identify( info );
+//    printf("%s %d, RM= %s, End lsn = %lu, id = %s\n", __func__, __LINE__, RmgrTable[rmid].rm_name, EndPos, id);
+//    fflush(stdout);
+
+    return EndPos;
 }
 
 /*
@@ -545,6 +555,10 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			needs_backup = false;
 		else if (!doPageWrites)
 			needs_backup = false;
+#ifdef DISABLE_TORN_PAGE_WRITE_PROTECT
+        else if (1)
+            needs_backup = false;
+#endif
 		else
 		{
 			/*

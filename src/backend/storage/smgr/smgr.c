@@ -21,11 +21,15 @@
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
+#include "storage/rpcmd.h"
 #include "storage/smgr.h"
+#include "storage/rpcclient.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
+#include <pthread.h>
 
 
+extern int IsRpcClient;
 /*
  * This struct of function pointers defines the API between smgr.c and
  * any individual storage manager module.  Note that smgr subfunctions are
@@ -81,7 +85,24 @@ static const f_smgr smgrsw[] = {
 		.smgr_nblocks = mdnblocks,
 		.smgr_truncate = mdtruncate,
 		.smgr_immedsync = mdimmedsync,
-	}
+	},
+    {
+        .smgr_init = rpcmdinit,
+        .smgr_shutdown = NULL,
+        .smgr_open = rpcmdopen,
+        .smgr_close = rpcmdclose,
+        .smgr_create = rpcmdcreate,
+        .smgr_exists = rpcmdexists,
+        .smgr_unlink = rpcmdunlink,
+        .smgr_extend = rpcmdextend,
+        .smgr_prefetch = rpcmdprefetch,
+        .smgr_read = rpcmdread,
+        .smgr_write = rpcmdwrite,
+        .smgr_writeback = rpcmdwriteback,
+        .smgr_nblocks = rpcmdnblocks,
+        .smgr_truncate = rpcmdtruncate,
+        .smgr_immedsync = rpcmdimmedsync,
+    }
 };
 
 static const int NSmgr = lengthof(smgrsw);
@@ -109,6 +130,12 @@ static void smgrshutdown(int code, Datum arg);
 void
 smgrinit(void)
 {
+    char *pgRpcClient = getenv("RPC_CLIENT");
+
+    if(pgRpcClient != NULL) {
+        IsRpcClient = 1;
+    }
+
 	int			i;
 
 	for (i = 0; i < NSmgr; i++)
@@ -141,9 +168,11 @@ smgrshutdown(int code, Datum arg)
  *
  *		This does not attempt to actually open the underlying file.
  */
+pthread_mutex_t smgr_open_mutex = PTHREAD_MUTEX_INITIALIZER;
 SMgrRelation
 smgropen(RelFileNode rnode, BackendId backend)
 {
+    pthread_mutex_lock(&smgr_open_mutex);
 	RelFileNodeBackend brnode;
 	SMgrRelation reln;
 	bool		found;
@@ -176,7 +205,11 @@ smgropen(RelFileNode rnode, BackendId backend)
 		reln->smgr_targblock = InvalidBlockNumber;
 		reln->smgr_fsm_nblocks = InvalidBlockNumber;
 		reln->smgr_vm_nblocks = InvalidBlockNumber;
-		reln->smgr_which = 0;	/* we only have md.c at present */
+
+        if(IsRpcClient)
+            reln->smgr_which = 1;
+        else
+    		reln->smgr_which = 0;	/* we only have md.c at present */
 
 		/* implementation-specific initialization */
 		smgrsw[reln->smgr_which].smgr_open(reln);
@@ -185,6 +218,7 @@ smgropen(RelFileNode rnode, BackendId backend)
 		dlist_push_tail(&unowned_relns, &reln->node);
 	}
 
+    pthread_mutex_unlock(&smgr_open_mutex);
 	return reln;
 }
 
@@ -429,6 +463,8 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 	for (i = 0; i < nrels; i++)
 		CacheInvalidateSmgr(rnodes[i]);
 
+    printf("%s %s %d \n", __func__ , __FILE__, __LINE__);
+    fflush(stdout);
 	/*
 	 * Delete the physical file(s).
 	 *
@@ -445,6 +481,8 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 			smgrsw[which].smgr_unlink(rnodes[i], forknum, isRedo);
 	}
 
+    printf("%s %s %d \n", __func__ , __FILE__, __LINE__);
+    fflush(stdout);
 	pfree(rnodes);
 }
 

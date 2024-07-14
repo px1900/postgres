@@ -123,6 +123,7 @@
 #include "storage/pg_shmem.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
+#include "storage/rpcclient.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/datetime.h"
@@ -436,7 +437,7 @@ static bool CreateOptsFile(int argc, char *argv[], char *fullprogname);
 static pid_t StartChildProcess(AuxProcType type);
 static void StartAutovacuumWorker(void);
 static void MaybeStartWalReceiver(void);
-static void InitPostmasterDeathWatchHandle(void);
+void InitPostmasterDeathWatchHandle(void);
 
 /*
  * Archiver is allowed to start up at the current postmaster state?
@@ -572,12 +573,19 @@ int			postmaster_alive_fds[2] = {-1, -1};
 HANDLE		PostmasterHandle;
 #endif
 
+extern int IsRpcClient;
 /*
  * Postmaster main entry point
  */
 void
 PostmasterMain(int argc, char *argv[])
 {
+    char *pgRpcClient = getenv("RPC_CLIENT");
+
+    if(pgRpcClient != NULL) {
+        IsRpcClient = 1;
+    }
+
 	int			opt;
 	int			status;
 	char	   *userDoption = NULL;
@@ -6622,7 +6630,7 @@ pgwin32_deadchild_callback(PVOID lpParameter, BOOLEAN TimerOrWaitFired)
  * Called once in the postmaster, so that child processes can subsequently
  * monitor if their parent is dead.
  */
-static void
+void
 InitPostmasterDeathWatchHandle(void)
 {
 #ifndef WIN32
