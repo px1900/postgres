@@ -901,15 +901,27 @@ select reltoastrelid, relkind, relfrozenxid
 
 drop view rules_fooview;
 
--- trying to convert a partitioned table to view is not allowed
+-- cannot convert an inheritance parent or child to a view, though
+create table rules_fooview (x int, y text);
+create table rules_fooview_child () inherits (rules_fooview);
+
+create rule "_RETURN" as on select to rules_fooview do instead
+  select 1 as x, 'aaa'::text as y;
+create rule "_RETURN" as on select to rules_fooview_child do instead
+  select 1 as x, 'aaa'::text as y;
+
+drop table rules_fooview cascade;
+
+-- likewise, converting a partitioned table or partition to view is not allowed
 create table rules_fooview (x int, y text) partition by list (x);
 create rule "_RETURN" as on select to rules_fooview do instead
   select 1 as x, 'aaa'::text as y;
 
--- nor can one convert a partition to view
 create table rules_fooview_part partition of rules_fooview for values in (1);
 create rule "_RETURN" as on select to rules_fooview_part do instead
   select 1 as x, 'aaa'::text as y;
+
+drop table rules_fooview;
 
 --
 -- check for planner problems with complex inherited UPDATES
@@ -979,6 +991,20 @@ select * from only t1_1;
 select * from only t1_2;
 
 reset constraint_exclusion;
+
+-- test FOR UPDATE in rules
+
+create table rules_base(f1 int, f2 int);
+insert into rules_base values(1,2), (11,12);
+create rule r1 as on update to rules_base do instead
+  select * from rules_base where f1 = 1 for update;
+update rules_base set f2 = f2 + 1;
+create or replace rule r1 as on update to rules_base do instead
+  select * from rules_base where f1 = 11 for update of rules_base;
+update rules_base set f2 = f2 + 1;
+create or replace rule r1 as on update to rules_base do instead
+  select * from rules_base where f1 = 11 for update of old; -- error
+drop table rules_base;
 
 -- test various flavors of pg_get_viewdef()
 

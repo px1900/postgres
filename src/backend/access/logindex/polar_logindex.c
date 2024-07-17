@@ -41,6 +41,7 @@
 #include "storage/ipc.h"
 #include "utils/memutils.h"
 
+
 static log_index_io_err_t       logindex_io_err = 0;
 static int                      logindex_errno = 0;
 logindex_snapshot_t logindexSnapShot;
@@ -137,10 +138,12 @@ log_index_mem_tbl_shmem_size(uint64 logindex_mem_tbl_size)
 	return size;
 }
 
+// Upgraded to REL_14_0
+// Change the LWLockMinimallyPadded to LWLockPadded
 static Size
 log_index_lwlock_shmem_size(uint64 logindex_mem_tbl_size)
 {
-	Size size = mul_size(sizeof(LWLockMinimallyPadded), LOG_INDEX_LWLOCK_NUM(logindex_mem_tbl_size));
+	Size size = mul_size(sizeof(LWLockPadded), LOG_INDEX_LWLOCK_NUM(logindex_mem_tbl_size));
 
 	return MAXALIGN(size);
 }
@@ -325,7 +328,7 @@ polar_logindex_snapshot_shmem_init(const char *name, uint64 logindex_mem_tbl_siz
 	snprintf(item_name, POLAR_MAX_SHMEM_NAME, "%s%s", name, LOGINDEX_LOCK_SUFFIX);
 
 	/* Align lwlocks to cacheline boundary */
-	logindex_snapshot->lwlock_array = (LWLockMinimallyPadded *)
+	logindex_snapshot->lwlock_array = (LWLockPadded *)
 									  ShmemInitStruct(item_name, log_index_lwlock_shmem_size(logindex_mem_tbl_size),
 													  &found_locks);
 
@@ -344,7 +347,7 @@ polar_logindex_snapshot_shmem_init(const char *name, uint64 logindex_mem_tbl_siz
 
 		SpinLockInit(LOG_INDEX_SNAPSHOT_LOCK);
 
-		StrNCpy(logindex_snapshot->dir, name, NAMEDATALEN);
+		strncpy(logindex_snapshot->dir, name, NAMEDATALEN);
 //		logindex_snapshot->segment_cache = NULL;
 	}
 	else
@@ -1033,7 +1036,7 @@ polar_logindex_used_mem_tbl_size(logindex_snapshot_t logindex_snapshot)
 uint64
 polar_logindex_convert_mem_tbl_size(uint64 mem_size)
 {
-	return (mem_size * 1024L * 1024L) / (sizeof(log_mem_table_t) + sizeof(LWLockMinimallyPadded));
+	return (mem_size * 1024L * 1024L) / (sizeof(log_mem_table_t) + sizeof(LWLockPadded));
 }
 
 //XI: if snapshot->meta.start_lsn is valid, return it

@@ -356,7 +356,7 @@ typedef struct log_index_promoted_info_t
 #define LOG_INDEX_MAX_TRACHE    4
 typedef struct log_index_snapshot_t
 {
-	LWLockMinimallyPadded      *lwlock_array;
+	LWLockPadded      *lwlock_array;
 	int                         mem_tbl_size;
 	logindex_table_flushable    table_flushable;
 	void						*extra_data; /* Extra data for table_flushable to use. */

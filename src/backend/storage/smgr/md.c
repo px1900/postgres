@@ -10,7 +10,7 @@
  * It doesn't matter whether the bits are on spinning rust or some other
  * storage technology.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -374,95 +374,122 @@ mdunlink(RelFileNodeBackend rnode, ForkNumber forkNum, bool isRedo)
         mdunlinkfork(rnode, forkNum, isRedo);
 }
 
+/*
+ * Truncate a file to release disk space.
+ */
+static int
+do_truncate(const char *path)
+{
+	int			save_errno;
+	int			ret;
+
+	ret = pg_truncate(path, 0);
+
+	/* Log a warning here to avoid repetition in callers. */
+	if (ret < 0 && errno != ENOENT)
+	{
+		save_errno = errno;
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not truncate file \"%s\": %m", path)));
+		errno = save_errno;
+	}
+
+	return ret;
+}
+
 static void
 mdunlinkfork(RelFileNodeBackend rnode, ForkNumber forkNum, bool isRedo)
 {
     ForkTagData forkTagData = InitForkTagData(rnode.node, forkNum);
     PartitionLock(MdPartitionMutex, (void*)&forkTagData);
+	char	   *path;
+	int			ret;
 
-    char	   *path;
-    int			ret;
+	path = relpath(rnode, forkNum);
 
-    path = relpath(rnode, forkNum);
+	/*
+	 * Delete or truncate the first segment.
+	 */
+	if (isRedo || forkNum != MAIN_FORKNUM || RelFileNodeBackendIsTemp(rnode))
+	{
+		if (!RelFileNodeBackendIsTemp(rnode))
+		{
+			/* Prevent other backends' fds from holding on to the disk space */
+			ret = do_truncate(path);
 
-    /*
-     * Delete or truncate the first segment.
-     */
-    if (isRedo || forkNum != MAIN_FORKNUM || RelFileNodeBackendIsTemp(rnode))
-    {
-        /* First, forget any pending sync requests for the first segment */
-        if (!RelFileNodeBackendIsTemp(rnode))
-            register_forget_request(rnode, forkNum, 0 /* first seg */ );
+			/* Forget any pending sync requests for the first segment */
+			register_forget_request(rnode, forkNum, 0 /* first seg */ );
+		}
+		else
+			ret = 0;
 
-        /* Next unlink the file */
-        ret = unlink(path);
-        if (ret < 0 && errno != ENOENT)
-            ereport(WARNING,
-                    (errcode_for_file_access(),
-                            errmsg("could not remove file \"%s\": %m", path)));
-    }
-    else
-    {
-        /* truncate(2) would be easier here, but Windows hasn't got it */
-        int			fd;
+		/* Next unlink the file, unless it was already found to be missing */
+		if (ret == 0 || errno != ENOENT)
+		{
+			ret = unlink(path);
+			if (ret < 0 && errno != ENOENT)
+				ereport(WARNING,
+						(errcode_for_file_access(),
+						 errmsg("could not remove file \"%s\": %m", path)));
+		}
+	}
+	else
+	{
+		/* Prevent other backends' fds from holding on to the disk space */
+		ret = do_truncate(path);
 
-        fd = OpenTransientFile(path, O_RDWR | PG_BINARY);
-        if (fd >= 0)
-        {
-            int			save_errno;
+		/* Register request to unlink first segment later */
+		register_unlink_segment(rnode, forkNum, 0 /* first seg */ );
+	}
 
-            ret = ftruncate(fd, 0);
-            save_errno = errno;
-            CloseTransientFile(fd);
-            errno = save_errno;
-        }
-        else
-            ret = -1;
-        if (ret < 0 && errno != ENOENT)
-            ereport(WARNING,
-                    (errcode_for_file_access(),
-                            errmsg("could not truncate file \"%s\": %m", path)));
+	/*
+	 * Delete any additional segments.
+	 */
+	if (ret >= 0)
+	{
+		char	   *segpath = (char *) palloc(strlen(path) + 12);
+		BlockNumber segno;
 
-        /* Register request to unlink first segment later */
-        register_unlink_segment(rnode, forkNum, 0 /* first seg */ );
-    }
+		/*
+		 * Note that because we loop until getting ENOENT, we will correctly
+		 * remove all inactive segments as well as active ones.
+		 */
+		for (segno = 1;; segno++)
+		{
+			sprintf(segpath, "%s.%u", path, segno);
 
-    /*
-     * Delete any additional segments.
-     */
-    if (ret >= 0)
-    {
-        char	   *segpath = (char *) palloc(strlen(path) + 12);
-        BlockNumber segno;
+			if (!RelFileNodeBackendIsTemp(rnode))
+			{
+				/*
+				 * Prevent other backends' fds from holding on to the disk
+				 * space.
+				 */
+				if (do_truncate(segpath) < 0 && errno == ENOENT)
+					break;
 
-        /*
-         * Note that because we loop until getting ENOENT, we will correctly
-         * remove all inactive segments as well as active ones.
-         */
-        for (segno = 1;; segno++)
-        {
-            /*
-             * Forget any pending sync requests for this segment before we try
-             * to unlink.
-             */
-            if (!RelFileNodeBackendIsTemp(rnode))
-                register_forget_request(rnode, forkNum, segno);
+				/*
+				 * Forget any pending sync requests for this segment before we
+				 * try to unlink.
+				 */
+				register_forget_request(rnode, forkNum, segno);
+			}
 
-            sprintf(segpath, "%s.%u", path, segno);
-            if (unlink(segpath) < 0)
-            {
-                /* ENOENT is expected after the last segment... */
-                if (errno != ENOENT)
-                    ereport(WARNING,
-                            (errcode_for_file_access(),
-                                    errmsg("could not remove file \"%s\": %m", segpath)));
-                break;
-            }
-        }
-        pfree(segpath);
-    }
+			if (unlink(segpath) < 0)
+			{
+				/* ENOENT is expected after the last segment... */
+				if (errno != ENOENT)
+					ereport(WARNING,
+							(errcode_for_file_access(),
+							 errmsg("could not remove file \"%s\": %m", segpath)));
+				break;
+			}
+		}
+		pfree(segpath);
+	}
 
-    pfree(path);
+	pfree(path);
+ 
     PartitionUnlock(MdPartitionMutex, (void*)&forkTagData);
 }
 
@@ -1136,10 +1163,10 @@ register_dirty_segment(SMgrRelation reln, ForkNumber forknum, MdfdVec *seg)
     /* Temp relations should never be fsync'd */
     Assert(!SmgrIsTemp(reln));
 
-    if (!RegisterSyncRequest(&tag, SYNC_REQUEST, false /* retryOnError */ ))
-    {
-        ereport(DEBUG1,
-                (errmsg("could not forward fsync request because request queue is full")));
+	if (!RegisterSyncRequest(&tag, SYNC_REQUEST, false /* retryOnError */ ))
+	{
+		ereport(DEBUG1,
+				(errmsg_internal("could not forward fsync request because request queue is full")));
 
         if (FileSync(seg->mdfd_vfd, WAIT_EVENT_DATA_FILE_SYNC) < 0)
             ereport(data_sync_elevel(ERROR),

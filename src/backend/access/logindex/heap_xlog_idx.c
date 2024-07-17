@@ -66,6 +66,7 @@ polar_heap_clear_vm(XLogReaderState *record, RelFileNode *rnode,
 
 /*
  * Handles MULTI_INSERT record type.
+ * Upgraded to REL_14_0
  */
 static XLogRedoAction
 polar_heap_xlog_multi_insert(XLogReaderState *record, BufferTag *tag, Buffer *buffer)
@@ -193,7 +194,11 @@ polar_heap_xlog_multi_insert(XLogReaderState *record, BufferTag *tag, Buffer *bu
 
             if (xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED)
                 PageClearAllVisible(page);
-        }
+            
+            /* XLH_INSERT_ALL_FROZEN_SET implies that all tuples are visible */
+    		if (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET)
+			    PageSetAllVisible(page);
+            }
     }
 
     return action;
@@ -340,6 +345,10 @@ polar_heap_xlog_insert(XLogReaderState *record, BufferTag *tag, Buffer *buffer)
 
             if (xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED)
                 PageClearAllVisible(page);
+            
+            /* XLH_INSERT_ALL_FROZEN_SET implies that all tuples are visible */
+		    if (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET)
+			    PageSetAllVisible(page);
 
         }
     }
@@ -937,13 +946,14 @@ polar_heap_xlog_inplace(XLogReaderState *record, BufferTag *tag, Buffer *buffer)
 }
 
 /*
- * Handles HEAP2_CLEAN record type
+ * Handles HEAP2_PRUNE record type
+ * Upgraded to REL_14_0
  */
 static XLogRedoAction
-polar_heap_xlog_clean(XLogReaderState *record, BufferTag *tag, Buffer *buffer)
+polar_heap_xlog_prune(XLogReaderState *record, BufferTag *tag, Buffer *buffer)
 {
     XLogRecPtr  lsn = record->EndRecPtr;
-    xl_heap_clean *xlrec = (xl_heap_clean *) XLogRecGetData(record);
+    xl_heap_prune *xlrec = (xl_heap_prune *) XLogRecGetData(record);
     XLogRedoAction action = BLK_NOTFOUND;
     BufferTag tag0;
 
@@ -997,6 +1007,64 @@ polar_heap_xlog_clean(XLogReaderState *record, BufferTag *tag, Buffer *buffer)
     return action;
 }
 
+/*
+ * Handles XLOG_HEAP2_VACUUM record type.
+ *
+ * Acquires an exclusive lock only.
+ */
+static XLogRedoAction
+polar_heap_xlog_vacuum(XLogReaderState *record, BufferTag *tag, Buffer *buffer)
+{
+	XLogRecPtr	lsn = record->EndRecPtr;
+	xl_heap_vacuum *xlrec = (xl_heap_vacuum *) XLogRecGetData(record);
+	BlockNumber blkno;
+    XLogRedoAction action = BLK_NOTFOUND;
+    BufferTag tag0;
+
+    POLAR_GET_LOG_TAG(record, tag0, 0);
+
+    if (!BUFFERTAGS_EQUAL(*tag, tag0))
+        return action;
+
+	/*
+	 * If we have a full-page image, restore it	(without using a cleanup lock)
+	 * and we're done.
+	 */
+	action = XLogReadBufferForRedoExtended(record, 0, RBM_NORMAL, false,
+										   buffer);
+	if (action == BLK_NEEDS_REDO)
+	{
+		Page		page = (Page) BufferGetPage(*buffer);
+		OffsetNumber *nowunused;
+		Size		datalen;
+		OffsetNumber *offnum;
+
+		nowunused = (OffsetNumber *) XLogRecGetBlockData(record, 0, &datalen);
+
+		/* Shouldn't be a record unless there's something to do */
+		Assert(xlrec->nunused > 0);
+
+		/* Update all now-unused line pointers */
+		offnum = nowunused;
+		for (int i = 0; i < xlrec->nunused; i++)
+		{
+			OffsetNumber off = *offnum++;
+			ItemId		lp = PageGetItemId(page, off);
+
+			Assert(ItemIdIsDead(lp) && !ItemIdHasStorage(lp));
+			ItemIdSetUnused(lp);
+		}
+
+		/* Attempt to truncate line pointer array now */
+		PageTruncateLinePointerArray(page);
+
+		PageSetLSN(page, lsn);
+	}
+
+    return action;
+}
+
+// Upgraded to REL_14_0
 static XLogRedoAction
 polar_heap_xlog_freeze_page(XLogReaderState *record, BufferTag *tag, Buffer *buffer)
 {
@@ -1717,13 +1785,10 @@ polar_heap2_idx_save(XLogReaderState *record)
 
     switch (info & XLOG_HEAP_OPMASK)
     {
-        case XLOG_HEAP2_CLEAN:
+        case XLOG_HEAP2_PRUNE:
+        case XLOG_HEAP2_VACUUM:
         case XLOG_HEAP2_FREEZE_PAGE:
             ParseXLogBlocksLsn(record, 0);
-            break;
-
-        case XLOG_HEAP2_CLEANUP_INFO:
-            /* don't modify buffer, nothing to do for parse, just do it */
             break;
 
         case XLOG_HEAP2_VISIBLE:
@@ -1765,17 +1830,14 @@ polar_heap2_idx_get_bufftag_list(XLogReaderState *record, BufferTag** buffertagL
 
     switch (info & XLOG_HEAP_OPMASK)
     {
-        case XLOG_HEAP2_CLEAN:
+        case XLOG_HEAP2_PRUNE:
+        case XLOG_HEAP2_VACUUM:
         case XLOG_HEAP2_FREEZE_PAGE:
             *buffertagList = (BufferTag*) malloc(sizeof(BufferTag) * 1);
 
             XLogRecGetBlockTag(record, 0, &rnode, &forkNumber, &blockNumber);
             INIT_BUFFERTAG(*buffertagList[0], rnode, forkNumber, blockNumber);
             *tagNum = 1;
-            break;
-
-        case XLOG_HEAP2_CLEANUP_INFO:
-            /* don't modify buffer, nothing to do for parse, just do it */
             break;
 
         case XLOG_HEAP2_VISIBLE:
@@ -1820,16 +1882,14 @@ polar_heap2_idx_redo(XLogReaderState *record, BufferTag *tag, Buffer *buffer)
 
     switch (info & XLOG_HEAP_OPMASK)
     {
-        case XLOG_HEAP2_CLEAN:
-            return polar_heap_xlog_clean(record, tag, buffer);
+        case XLOG_HEAP2_PRUNE:
+            return polar_heap_xlog_prune(record, tag, buffer);
+        
+        case XLOG_HEAP2_VACUUM:
+            return polar_heap_xlog_vacuum(record, tag, buffer);
 
         case XLOG_HEAP2_FREEZE_PAGE:
             return polar_heap_xlog_freeze_page(record, tag, buffer);
-
-        case XLOG_HEAP2_CLEANUP_INFO:
-            /* nothing to do, don't modify buffer, never here*/
-            Assert(0);
-            break;
 
         case XLOG_HEAP2_VISIBLE:
             return polar_heap_xlog_visible(record, tag, buffer);

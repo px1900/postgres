@@ -243,7 +243,8 @@ sigusr1_handler(SIGNAL_ARGS) {
 //    SetLatch(MyLatch);
 //    WakeupRecovery();
     WakeupStartupRecovery();
-    latch_sigusr1_handler();
+    // Upgrade to REL_14_0, temporary disable this handler()
+    // latch_sigusr1_handler();
 }
 
 int **serverPipe;

@@ -55,6 +55,32 @@ typedef uint64  log_range_id_t;
 		*(buffer) = (!BufferIsValid(*buffer)) ? XLogInitBufferForRedo(record, block_id) : *(buffer); \
 	} while (0)
 
+/*
+ * Size of the bitmap on each visibility map page, in bytes. There's no
+ * extra headers, so the whole page minus the standard page header is
+ * used for the bitmap.
+ */
+#define MAPSIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData))
+
+/* Number of heap blocks we can represent in one byte */
+#define HEAPBLOCKS_PER_BYTE (BITS_PER_BYTE / BITS_PER_HEAPBLOCK)
+
+/* Number of heap blocks we can represent in one visibility map pa
+ge. */
+#define HEAPBLOCKS_PER_PAGE (MAPSIZE * HEAPBLOCKS_PER_BYTE)
+
+/* Mapping from heap block number to the right bit in the visibili
+ty map */
+#define HEAPBLK_TO_MAPBLOCK(x) ((x) / HEAPBLOCKS_PER_PAGE)
+#define HEAPBLK_TO_MAPBYTE(x) (((x) % HEAPBLOCKS_PER_PAGE) / HEAPBLOCKS_PER_BYTE)
+#define HEAPBLK_TO_OFFSET(x) (((x) % HEAPBLOCKS_PER_BYTE) * BITS_PER_HEAPBLOCK)
+
+
+/* Masks for counting subsets of bits in the visibility map. */
+#define VISIBLE_MASK64	UINT64CONST(0x5555555555555555) /* The lower bit of each
+														 * bit pair */
+#define FROZEN_MASK64	UINT64CONST(0xaaaaaaaaaaaaaaaa) /* The upper bit of each
+														 * bit pair */
 struct log_mem_table_t;
 struct log_index_iter_data_t;
 typedef struct log_index_snapshot_t             *logindex_snapshot_t;

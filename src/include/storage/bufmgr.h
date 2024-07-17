@@ -4,7 +4,7 @@
  *	  POSTGRES buffer manager definitions.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/bufmgr.h
@@ -180,6 +180,9 @@ extern PrefetchBufferResult PrefetchSharedBuffer(struct SMgrRelationData *smgr_r
 extern PrefetchBufferResult PrefetchBuffer(Relation reln, ForkNumber forkNum,
                                            BlockNumber blockNum);
 
+extern bool ReadRecentBuffer(RelFileNode rnode, ForkNumber forkNum,
+							 BlockNumber blockNum, Buffer recent_buffer);
+
 extern Buffer ReadBuffer(Relation reln, BlockNumber blockNum);
 
 extern Buffer ReadBufferExtended(Relation reln, ForkNumber forkNum,
@@ -226,10 +229,9 @@ extern void FlushRelationsAllBuffers(struct SMgrRelationData **smgrs, int nrels)
 
 extern void FlushDatabaseBuffers(Oid dbid);
 
-extern void DropRelFileNodeBuffers(RelFileNodeBackend rnode, ForkNumber *forkNum,
-                                   int nforks, BlockNumber *firstDelBlock);
-
-extern void DropRelFileNodesAllBuffers(RelFileNodeBackend *rnodes, int nnodes);
+extern void DropRelFileNodeBuffers(struct SMgrRelationData *smgr_reln, ForkNumber *forkNum,
+								   int nforks, BlockNumber *firstDelBlock);
+extern void DropRelFileNodesAllBuffers(struct SMgrRelationData **smgr_reln, int nnodes);
 
 extern void DropDatabaseBuffers(Oid dbid);
 

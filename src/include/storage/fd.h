@@ -4,7 +4,7 @@
  *	  Virtual file descriptor definitions.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/fd.h
@@ -49,6 +49,13 @@ extern "C" {
 
 #include <dirent.h>
 
+typedef enum RecoveryInitSyncMethod
+{
+	RECOVERY_INIT_SYNC_METHOD_FSYNC,
+	RECOVERY_INIT_SYNC_METHOD_SYNCFS
+}			RecoveryInitSyncMethod;
+
+struct iovec;					/* avoid including port/pg_iovec.h here */
 
 typedef int File;
 
@@ -56,6 +63,7 @@ typedef int File;
 /* GUC parameter */
 extern PGDLLIMPORT int max_files_per_process;
 extern PGDLLIMPORT bool data_sync_retry;
+extern int	recovery_init_sync_method;
 
 /*
  * This is private to fd.c, but exported for save/restore_backend_variables()
@@ -113,7 +121,7 @@ extern mode_t FileGetRawMode(File file);
 /* Operations used for sharing named temporary files */
 extern File PathNameCreateTemporaryFile(const char *name, bool error_on_failure);
 
-extern File PathNameOpenTemporaryFile(const char *name);
+extern File PathNameOpenTemporaryFile(const char *path, int mode);
 
 extern bool PathNameDeleteTemporaryFile(const char *name, bool error_on_failure);
 
@@ -192,7 +200,23 @@ extern void RemovePgTempFilesInDir(const char *tmpdirname, bool missing_ok,
 
 extern bool looks_like_temp_rel_name(const char *name);
 
-extern int pg_fsync(int fd);
+extern int	pg_fsync(int fd);
+extern int	pg_fsync_no_writethrough(int fd);
+extern int	pg_fsync_writethrough(int fd);
+extern int	pg_fdatasync(int fd);
+extern void pg_flush_data(int fd, off_t offset, off_t amount);
+extern ssize_t pg_pwritev_with_retry(int fd,
+									 const struct iovec *iov,
+									 int iovcnt,
+									 off_t offset);
+extern int	pg_truncate(const char *path, off_t length);
+extern void fsync_fname(const char *fname, bool isdir);
+extern int	fsync_fname_ext(const char *fname, bool isdir, bool ignore_perm, int elevel);
+extern int	durable_rename(const char *oldfile, const char *newfile, int loglevel);
+extern int	durable_unlink(const char *fname, int loglevel);
+extern int	durable_rename_excl(const char *oldfile, const char *newfile, int loglevel);
+extern void SyncDataDirectory(void);
+extern int	data_sync_elevel(int elevel);
 
 extern int pg_fsync_no_writethrough(int fd);
 

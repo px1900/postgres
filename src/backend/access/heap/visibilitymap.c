@@ -3,7 +3,7 @@
  * visibilitymap.c
  *	  bitmap for tracking visibility of heap tuples
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -98,6 +98,27 @@
 
 
 /*#define TRACE_VISIBILITYMAP */
+
+/*
+ * Size of the bitmap on each visibility map page, in bytes. There's no
+ * extra headers, so the whole page minus the standard page header is
+ * used for the bitmap.
+ */
+#define MAPSIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData))
+
+/* Number of heap blocks we can represent in one byte */
+#define HEAPBLOCKS_PER_BYTE (BITS_PER_BYTE / BITS_PER_HEAPBLOCK)
+
+/* Number of heap blocks we can represent in one visibility map pa
+ge. */
+#define HEAPBLOCKS_PER_PAGE (MAPSIZE * HEAPBLOCKS_PER_BYTE)
+
+/* Mapping from heap block number to the right bit in the visibili
+ty map */
+#define HEAPBLK_TO_MAPBLOCK(x) ((x) / HEAPBLOCKS_PER_PAGE)
+#define HEAPBLK_TO_MAPBYTE(x) (((x) % HEAPBLOCKS_PER_PAGE) / HEAPBLOCKS_PER_BYTE)
+#define HEAPBLK_TO_OFFSET(x) (((x) % HEAPBLOCKS_PER_BYTE) * BITS_PER_HEAPBLOCK)
+
 
 /* Masks for counting subsets of bits in the visibility map. */
 #define VISIBLE_MASK64	UINT64CONST(0x5555555555555555) /* The lower bit of each
@@ -571,17 +592,16 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 	 * If we haven't cached the size of the visibility map fork yet, check it
 	 * first.
 	 */
-	if (rel->rd_smgr->smgr_vm_nblocks == InvalidBlockNumber)
+	if (rel->rd_smgr->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] == InvalidBlockNumber)
 	{
 		if (smgrexists(rel->rd_smgr, VISIBILITYMAP_FORKNUM))
-			rel->rd_smgr->smgr_vm_nblocks = smgrnblocks(rel->rd_smgr,
-														VISIBILITYMAP_FORKNUM);
+			smgrnblocks(rel->rd_smgr, VISIBILITYMAP_FORKNUM);
 		else
-			rel->rd_smgr->smgr_vm_nblocks = 0;
+			rel->rd_smgr->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = 0;
 	}
 
 	/* Handle requests beyond EOF */
-	if (blkno >= rel->rd_smgr->smgr_vm_nblocks)
+	if (blkno >= rel->rd_smgr->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM])
 	{
 		if (extend)
 			vm_extend(rel, blkno + 1);
@@ -651,11 +671,13 @@ vm_extend(Relation rel, BlockNumber vm_nblocks)
 	 * Create the file first if it doesn't exist.  If smgr_vm_nblocks is
 	 * positive then it must exist, no need for an smgrexists call.
 	 */
-	if ((rel->rd_smgr->smgr_vm_nblocks == 0 ||
-		 rel->rd_smgr->smgr_vm_nblocks == InvalidBlockNumber) &&
+	if ((rel->rd_smgr->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] == 0 ||
+		 rel->rd_smgr->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] == InvalidBlockNumber) &&
 		!smgrexists(rel->rd_smgr, VISIBILITYMAP_FORKNUM))
 		smgrcreate(rel->rd_smgr, VISIBILITYMAP_FORKNUM, false);
 
+	/* Invalidate cache so that smgrnblocks() asks the kernel. */
+	rel->rd_smgr->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = InvalidBlockNumber;
 	vm_nblocks_now = smgrnblocks(rel->rd_smgr, VISIBILITYMAP_FORKNUM);
 
 	/* Now extend the file */
@@ -676,9 +698,6 @@ vm_extend(Relation rel, BlockNumber vm_nblocks)
 	 * infrequently.
 	 */
 	CacheInvalidateSmgr(rel->rd_smgr->smgr_rnode);
-
-	/* Update local cache with the up-to-date size */
-	rel->rd_smgr->smgr_vm_nblocks = vm_nblocks_now;
 
 	UnlockRelationForExtension(rel, ExclusiveLock);
 }

@@ -1,22 +1,22 @@
 /*-------------------------------------------------------------------------
  * relation.c
- *	   PostgreSQL logical replication
+ *	   PostgreSQL logical replication relation mapping cache
  *
- * Copyright (c) 2016-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2021, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logical/relation.c
  *
  * NOTES
- *	  This file contains helper functions for logical replication relation
- *	  mapping cache.
+ *	  Routines in this file mainly have to do with mapping the properties
+ *	  of local replication target relations to the properties of their
+ *	  remote counterpart.
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
-#include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_subscription_rel.h"
@@ -24,16 +24,12 @@
 #include "nodes/makefuncs.h"
 #include "replication/logicalrelation.h"
 #include "replication/worker_internal.h"
-#include "utils/builtins.h"
 #include "utils/inval.h"
-#include "utils/lsyscache.h"
-#include "utils/memutils.h"
-#include "utils/syscache.h"
+
 
 static MemoryContext LogicalRepRelMapContext = NULL;
 
 static HTAB *LogicalRepRelMap = NULL;
-static HTAB *LogicalRepTypMap = NULL;
 
 /*
  * Partition map (LogicalRepPartMap)
@@ -77,7 +73,7 @@ logicalrep_relmap_invalidate_cb(Datum arg, Oid reloid)
 		{
 			if (entry->localreloid == reloid)
 			{
-				entry->localreloid = InvalidOid;
+				entry->localrelvalid = false;
 				hash_seq_term(&status);
 				break;
 			}
@@ -91,7 +87,7 @@ logicalrep_relmap_invalidate_cb(Datum arg, Oid reloid)
 		hash_seq_init(&status, LogicalRepRelMap);
 
 		while ((entry = (LogicalRepRelMapEntry *) hash_seq_search(&status)) != NULL)
-			entry->localreloid = InvalidOid;
+			entry->localrelvalid = false;
 	}
 }
 
@@ -110,22 +106,11 @@ logicalrep_relmap_init(void)
 								  ALLOCSET_DEFAULT_SIZES);
 
 	/* Initialize the relation hash table. */
-	MemSet(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(LogicalRepRelId);
 	ctl.entrysize = sizeof(LogicalRepRelMapEntry);
 	ctl.hcxt = LogicalRepRelMapContext;
 
 	LogicalRepRelMap = hash_create("logicalrep relation map cache", 128, &ctl,
-								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-
-	/* Initialize the type hash table. */
-	MemSet(&ctl, 0, sizeof(ctl));
-	ctl.keysize = sizeof(Oid);
-	ctl.entrysize = sizeof(LogicalRepTyp);
-	ctl.hcxt = LogicalRepRelMapContext;
-
-	/* This will usually be small. */
-	LogicalRepTypMap = hash_create("logicalrep type map cache", 2, &ctl,
 								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	/* Watch for invalidation events. */
@@ -228,17 +213,52 @@ logicalrep_rel_att_by_name(LogicalRepRelation *remoterel, const char *attname)
 }
 
 /*
+ * Report error with names of the missing local relation column(s), if any.
+ */
+static void
+logicalrep_report_missing_attrs(LogicalRepRelation *remoterel,
+								Bitmapset *missingatts)
+{
+	if (!bms_is_empty(missingatts))
+	{
+		StringInfoData missingattsbuf;
+		int			missingattcnt = 0;
+		int			i;
+
+		initStringInfo(&missingattsbuf);
+
+		while ((i = bms_first_member(missingatts)) >= 0)
+		{
+			missingattcnt++;
+			if (missingattcnt == 1)
+				appendStringInfo(&missingattsbuf, _("\"%s\""),
+								 remoterel->attnames[i]);
+			else
+				appendStringInfo(&missingattsbuf, _(", \"%s\""),
+								 remoterel->attnames[i]);
+		}
+
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg_plural("logical replication target relation \"%s.%s\" is missing replicated column: %s",
+							   "logical replication target relation \"%s.%s\" is missing replicated columns: %s",
+							   missingattcnt,
+							   remoterel->nspname,
+							   remoterel->relname,
+							   missingattsbuf.data)));
+	}
+}
+
+/*
  * Open the local relation associated with the remote one.
  *
- * Optionally rebuilds the Relcache mapping if it was invalidated
- * by local DDL.
+ * Rebuilds the Relcache mapping if it was invalidated by local DDL.
  */
 LogicalRepRelMapEntry *
 logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 {
 	LogicalRepRelMapEntry *entry;
 	bool		found;
-	Oid			relid = InvalidOid;
 	LogicalRepRelation *remoterel;
 
 	if (LogicalRepRelMap == NULL)
@@ -254,14 +274,45 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 
 	remoterel = &entry->remoterel;
 
+	/* Ensure we don't leak a relcache refcount. */
+	if (entry->localrel)
+		elog(ERROR, "remote relation ID %u is already open", remoteid);
+
 	/*
 	 * When opening and locking a relation, pending invalidation messages are
-	 * processed which can invalidate the relation.  We need to update the
-	 * local cache both when we are first time accessing the relation and when
-	 * the relation is invalidated (aka entry->localreloid is set InvalidOid).
+	 * processed which can invalidate the relation.  Hence, if the entry is
+	 * currently considered valid, try to open the local relation by OID and
+	 * see if invalidation ensues.
 	 */
-	if (!OidIsValid(entry->localreloid))
+	if (entry->localrelvalid)
 	{
+		entry->localrel = try_table_open(entry->localreloid, lockmode);
+		if (!entry->localrel)
+		{
+			/* Table was renamed or dropped. */
+			entry->localrelvalid = false;
+		}
+		else if (!entry->localrelvalid)
+		{
+			/* Note we release the no-longer-useful lock here. */
+			table_close(entry->localrel, lockmode);
+			entry->localrel = NULL;
+		}
+	}
+
+	/*
+	 * If the entry has been marked invalid since we last had lock on it,
+	 * re-open the local relation by name and rebuild all derived data.
+	 */
+	if (!entry->localrelvalid)
+	{
+		Oid			relid;
+		Bitmapset  *idkey;
+		TupleDesc	desc;
+		MemoryContext oldctx;
+		int			i;
+		Bitmapset  *missingatts;
+
 		/* Try to find and lock the relation by name. */
 		relid = RangeVarGetRelid(makeRangeVar(remoterel->nspname,
 											  remoterel->relname, -1),
@@ -272,21 +323,7 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 					 errmsg("logical replication target relation \"%s.%s\" does not exist",
 							remoterel->nspname, remoterel->relname)));
 		entry->localrel = table_open(relid, NoLock);
-
-	}
-	else
-	{
-		relid = entry->localreloid;
-		entry->localrel = table_open(entry->localreloid, lockmode);
-	}
-
-	if (!OidIsValid(entry->localreloid))
-	{
-		int			found;
-		Bitmapset  *idkey;
-		TupleDesc	desc;
-		MemoryContext oldctx;
-		int			i;
+		entry->localreloid = relid;
 
 		/* Check for supported relkind. */
 		CheckSubscriptionRelkind(entry->localrel->rd_rel->relkind,
@@ -302,7 +339,8 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 		entry->attrmap = make_attrmap(desc->natts);
 		MemoryContextSwitchTo(oldctx);
 
-		found = 0;
+		/* check and report missing attrs, if any */
+		missingatts = bms_add_range(NULL, 0, remoterel->natts - 1);
 		for (i = 0; i < desc->natts; i++)
 		{
 			int			attnum;
@@ -319,16 +357,13 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 
 			entry->attrmap->attnums[i] = attnum;
 			if (attnum >= 0)
-				found++;
+				missingatts = bms_del_member(missingatts, attnum);
 		}
 
-		/* TODO, detail message with names of missing columns */
-		if (found < remoterel->natts)
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("logical replication target relation \"%s.%s\" is missing "
-							"some replicated columns",
-							remoterel->nspname, remoterel->relname)));
+		logicalrep_report_missing_attrs(remoterel, missingatts);
+
+		/* be tidy */
+		bms_free(missingatts);
 
 		/*
 		 * Check that replica identity matches. We allow for stricter replica
@@ -380,14 +415,13 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 			}
 		}
 
-		entry->localreloid = relid;
+		entry->localrelvalid = true;
 	}
 
 	if (entry->state != SUBREL_STATE_READY)
 		entry->state = GetSubscriptionRelState(MySubscription->oid,
 											   entry->localreloid,
-											   &entry->statelsn,
-											   true);
+											   &entry->statelsn);
 
 	return entry;
 }
@@ -400,95 +434,6 @@ logicalrep_rel_close(LogicalRepRelMapEntry *rel, LOCKMODE lockmode)
 {
 	table_close(rel->localrel, lockmode);
 	rel->localrel = NULL;
-}
-
-/*
- * Free the type map cache entry data.
- */
-static void
-logicalrep_typmap_free_entry(LogicalRepTyp *entry)
-{
-	pfree(entry->nspname);
-	pfree(entry->typname);
-}
-
-/*
- * Add new entry or update existing entry in the type map cache.
- */
-void
-logicalrep_typmap_update(LogicalRepTyp *remotetyp)
-{
-	MemoryContext oldctx;
-	LogicalRepTyp *entry;
-	bool		found;
-
-	if (LogicalRepTypMap == NULL)
-		logicalrep_relmap_init();
-
-	/*
-	 * HASH_ENTER returns the existing entry if present or creates a new one.
-	 */
-	entry = hash_search(LogicalRepTypMap, (void *) &remotetyp->remoteid,
-						HASH_ENTER, &found);
-
-	if (found)
-		logicalrep_typmap_free_entry(entry);
-
-	/* Make cached copy of the data */
-	entry->remoteid = remotetyp->remoteid;
-	oldctx = MemoryContextSwitchTo(LogicalRepRelMapContext);
-	entry->nspname = pstrdup(remotetyp->nspname);
-	entry->typname = pstrdup(remotetyp->typname);
-	MemoryContextSwitchTo(oldctx);
-}
-
-/*
- * Fetch type name from the cache by remote type OID.
- *
- * Return a substitute value if we cannot find the data type; no message is
- * sent to the log in that case, because this is used by error callback
- * already.
- */
-char *
-logicalrep_typmap_gettypname(Oid remoteid)
-{
-	LogicalRepTyp *entry;
-	bool		found;
-
-	/* Internal types are mapped directly. */
-	if (remoteid < FirstGenbkiObjectId)
-	{
-		if (!get_typisdefined(remoteid))
-		{
-			/*
-			 * This can be caused by having a publisher with a higher
-			 * PostgreSQL major version than the subscriber.
-			 */
-			return psprintf("unrecognized %u", remoteid);
-		}
-
-		return format_type_be(remoteid);
-	}
-
-	if (LogicalRepTypMap == NULL)
-	{
-		/*
-		 * If the typemap is not initialized yet, we cannot possibly attempt
-		 * to search the hash table; but there's no way we know the type
-		 * locally yet, since we haven't received a message about this type,
-		 * so this is the best we can do.
-		 */
-		return psprintf("unrecognized %u", remoteid);
-	}
-
-	/* search the mapping */
-	entry = hash_search(LogicalRepTypMap, (void *) &remoteid,
-						HASH_FIND, &found);
-	if (!found)
-		return psprintf("unrecognized %u", remoteid);
-
-	Assert(OidIsValid(entry->remoteid));
-	return psprintf("%s.%s", entry->nspname, entry->typname);
 }
 
 /*
@@ -523,7 +468,7 @@ logicalrep_partmap_invalidate_cb(Datum arg, Oid reloid)
 		{
 			if (entry->localreloid == reloid)
 			{
-				entry->localreloid = InvalidOid;
+				entry->localrelvalid = false;
 				hash_seq_term(&status);
 				break;
 			}
@@ -537,7 +482,7 @@ logicalrep_partmap_invalidate_cb(Datum arg, Oid reloid)
 		hash_seq_init(&status, LogicalRepPartMap);
 
 		while ((entry = (LogicalRepRelMapEntry *) hash_seq_search(&status)) != NULL)
-			entry->localreloid = InvalidOid;
+			entry->localrelvalid = false;
 	}
 }
 
@@ -556,7 +501,6 @@ logicalrep_partmap_init(void)
 								  ALLOCSET_DEFAULT_SIZES);
 
 	/* Initialize the relation hash table. */
-	MemSet(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(Oid);	/* partition OID */
 	ctl.entrysize = sizeof(LogicalRepPartMapEntry);
 	ctl.hcxt = LogicalRepPartMapContext;
@@ -573,10 +517,12 @@ logicalrep_partmap_init(void)
  * logicalrep_partition_open
  *
  * Returned entry reuses most of the values of the root table's entry, save
- * the attribute map, which can be different for the partition.
+ * the attribute map, which can be different for the partition.  However,
+ * we must physically copy all the data, in case the root table's entry
+ * gets freed/rebuilt.
  *
  * Note there's no logicalrep_partition_close, because the caller closes the
- * the component relation.
+ * component relation.
  */
 LogicalRepRelMapEntry *
 logicalrep_partition_open(LogicalRepRelMapEntry *root,
@@ -609,7 +555,7 @@ logicalrep_partition_open(LogicalRepRelMapEntry *root,
 
 	part_entry->partoid = partOid;
 
-	/* Remote relation is used as-is from the root entry. */
+	/* Remote relation is copied as-is from the root entry. */
 	entry = &part_entry->relmapentry;
 	entry->remoterel.remoteid = remoterel->remoteid;
 	entry->remoterel.nspname = pstrdup(remoterel->nspname);
@@ -631,8 +577,8 @@ logicalrep_partition_open(LogicalRepRelMapEntry *root,
 	/*
 	 * If the partition's attributes don't match the root relation's, we'll
 	 * need to make a new attrmap which maps partition attribute numbers to
-	 * remoterel's, instead the original which maps root relation's attribute
-	 * numbers to remoterel's.
+	 * remoterel's, instead of the original which maps root relation's
+	 * attribute numbers to remoterel's.
 	 *
 	 * Note that 'map' which comes from the tuple routing data structure
 	 * contains 1-based attribute numbers (of the parent relation).  However,
@@ -652,9 +598,16 @@ logicalrep_partition_open(LogicalRepRelMapEntry *root,
 		}
 	}
 	else
-		entry->attrmap = attrmap;
+	{
+		/* Lacking copy_attmap, do this the hard way. */
+		entry->attrmap = make_attrmap(attrmap->maplen);
+		memcpy(entry->attrmap->attnums, attrmap->attnums,
+			   attrmap->maplen * sizeof(AttrNumber));
+	}
 
 	entry->updatable = root->updatable;
+
+	entry->localrelvalid = true;
 
 	/* state and statelsn are left set to 0. */
 	MemoryContextSwitchTo(oldctx);

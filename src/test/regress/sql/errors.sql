@@ -37,6 +37,10 @@ select * from pg_database where pg_database.datname = nonesuch;
 -- bad attribute name in select distinct on
 select distinct on (foobar) * from pg_database;
 
+-- grouping with FOR UPDATE
+select null from pg_database group by datname for update;
+select null from pg_database group by grouping sets (()) for update;
+
 
 --
 -- DELETE
@@ -364,12 +368,3 @@ INT4
 UNIQUE
 NOT
 NULL);
-
--- Check that stack depth detection mechanism works and
--- max_stack_depth is not set too high.  The full error report is not
--- very stable, so show only SQLSTATE and primary error message.
-create function infinite_recurse() returns int as
-'select infinite_recurse()' language sql;
-\set VERBOSITY sqlstate
-select infinite_recurse();
-\echo :LAST_ERROR_MESSAGE

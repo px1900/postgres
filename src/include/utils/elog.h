@@ -4,7 +4,7 @@
  *	  POSTGRES error reporting/logging definitions.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/elog.h
@@ -44,19 +44,21 @@ extern "C" {
 #define WARNING        19            /* Warnings.  NOTICE is for expected messages
 								 * like implicit sequence creation by SERIAL.
 								 * WARNING is for unexpected messages. */
-#define ERROR        20            /* user error - abort transaction; return to
+#define PGWARNING	19			/* Must equal WARNING; see NOTE below. */
+#define WARNING_CLIENT_ONLY	20	/* Warnings to be sent to client as usual, but
+								 * never to the server log. */
+#define ERROR		21			/* user error - abort transaction; return to
 								 * known state */
-/* Save ERROR value in PGERROR so it can be restored when Win32 includes
- * modify it.  We have to use a constant rather than ERROR because macros
- * are expanded only when referenced outside macros.
- */
-#ifdef WIN32
-#define PGERROR		20
-#endif
-#define FATAL        21            /* fatal error - abort process */
-#define PANIC        22            /* take down the other backends with me */
+#define PGERROR		21			/* Must equal ERROR; see NOTE below. */
+#define FATAL		22			/* fatal error - abort process */
+#define PANIC		23			/* take down the other backends with me */
 
-/* #define DEBUG DEBUG1 */    /* Backward compatibility with pre-7.3 */
+/*
+ * NOTE: the alternate names PGWARNING and PGERROR are useful for dealing
+ * with third-party headers that make other definitions of WARNING and/or
+ * ERROR.  One can, for example, re-define ERROR as PGERROR after including
+ * such a header.
+ */
 
 
 /* macros for representing SQLSTATE strings compactly */
@@ -115,6 +117,15 @@ extern "C" {
  * ereport_domain() directly, or preferably they can override the TEXTDOMAIN
  * macro.
  *
+ * When __builtin_constant_p is available and elevel >= ERROR we make a call
+ * to errstart_cold() instead of errstart().  This version of the function is
+ * marked with pg_attribute_cold which will coax supporting compilers into
+ * generating code which is more optimized towards non-ERROR cases.  Because
+ * we use __builtin_constant_p() in the condition, when elevel is not a
+ * compile-time constant, or if it is, but it's < ERROR, the compiler has no
+ * need to generate any code for this branch.  It can simply call errstart()
+ * unconditionally.
+ *
  * If elevel >= ERROR, the call will not return; we try to inform the compiler
  * of that via pg_unreachable().  However, no useful optimization effect is
  * obtained unless the compiler sees elevel as a compile-time constant, else
@@ -125,14 +136,17 @@ extern "C" {
  *----------
  */
 #ifdef HAVE__BUILTIN_CONSTANT_P
-#define ereport_domain(elevel, domain, ...)    \
-    do { \
-        pg_prevent_errno_in_scope(); \
-        if (errstart(elevel, domain)) \
-            __VA_ARGS__, errfinish(__FILE__, __LINE__, PG_FUNCNAME_MACRO); \
-        if (__builtin_constant_p(elevel) && (elevel) >= ERROR) \
-            pg_unreachable(); \
-    } while(0)
+
+#define ereport_domain(elevel, domain, ...)	\
+	do { \
+		pg_prevent_errno_in_scope(); \
+		if (__builtin_constant_p(elevel) && (elevel) >= ERROR ? \
+			errstart_cold(elevel, domain) : \
+			errstart(elevel, domain)) \
+			__VA_ARGS__, errfinish(__FILE__, __LINE__, PG_FUNCNAME_MACRO); \
+		if (__builtin_constant_p(elevel) && (elevel) >= ERROR) \
+			pg_unreachable(); \
+	} while(0)
 #else							/* !HAVE__BUILTIN_CONSTANT_P */
 #define ereport_domain(elevel, domain, ...)	\
     do { \
@@ -150,7 +164,11 @@ extern "C" {
 
 #define TEXTDOMAIN NULL
 
+extern bool message_level_is_interesting(int elevel);
+
 extern bool errstart(int elevel, const char *domain);
+
+extern pg_attribute_cold bool errstart_cold(int elevel, const char *domain);
 
 extern void errfinish(const char *filename, int lineno, const char *funcname);
 
@@ -182,6 +200,9 @@ extern int errdetail_plural(const char *fmt_singular, const char *fmt_plural,
 
 extern int errhint(const char *fmt, ...) pg_attribute_printf(1, 2);
 
+extern int	errhint_plural(const char *fmt_singular, const char *fmt_plural,
+						   unsigned long n,...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
+
 /*
  * errcontext() is typically called in error context callback functions, not
  * within an ereport() invocation. The callback function can be in a different
@@ -200,7 +221,7 @@ extern int errhidestmt(bool hide_stmt);
 
 extern int errhidecontext(bool hide_ctx);
 
-extern int errbacktrace(void);
+extern int	errposition(int cursorpos);
 
 extern int errfunction(const char *funcname);
 
@@ -363,35 +384,36 @@ extern PGDLLIMPORT sigjmp_buf *PG_exception_stack;
  * (The const pointers are an exception; we assume they point at non-freeable
  * constant strings.)
  */
-typedef struct ErrorData {
-    int elevel;            /* error level */
-    bool output_to_server;    /* will report to server log? */
-    bool output_to_client;    /* will report to client? */
-    bool show_funcname;    /* true to force funcname inclusion */
-    bool hide_stmt;        /* true to prevent STATEMENT: inclusion */
-    bool hide_ctx;        /* true to prevent CONTEXT: inclusion */
-    const char *filename;        /* __FILE__ of ereport() call */
-    int lineno;            /* __LINE__ of ereport() call */
-    const char *funcname;        /* __func__ of ereport() call */
-    const char *domain;            /* message domain */
-    const char *context_domain; /* message domain for context message */
-    int sqlerrcode;        /* encoded ERRSTATE */
-    char *message;        /* primary error message (translated) */
-    char *detail;            /* detail error message */
-    char *detail_log;        /* detail error message for server log only */
-    char *hint;            /* hint message */
-    char *context;        /* context message */
-    char *backtrace;        /* backtrace */
-    const char *message_id;        /* primary message's id (original string) */
-    char *schema_name;    /* name of schema */
-    char *table_name;        /* name of table */
-    char *column_name;    /* name of column */
-    char *datatype_name;    /* name of datatype */
-    char *constraint_name;    /* name of constraint */
-    int cursorpos;        /* cursor index into query string */
-    int internalpos;    /* cursor index into internalquery */
-    char *internalquery;    /* text of internally-generated query */
-    int saved_errno;    /* errno at entry */
+
+typedef struct ErrorData
+{
+	int			elevel;			/* error level */
+	bool		output_to_server;	/* will report to server log? */
+	bool		output_to_client;	/* will report to client? */
+	bool		hide_stmt;		/* true to prevent STATEMENT: inclusion */
+	bool		hide_ctx;		/* true to prevent CONTEXT: inclusion */
+	const char *filename;		/* __FILE__ of ereport() call */
+	int			lineno;			/* __LINE__ of ereport() call */
+	const char *funcname;		/* __func__ of ereport() call */
+	const char *domain;			/* message domain */
+	const char *context_domain; /* message domain for context message */
+	int			sqlerrcode;		/* encoded ERRSTATE */
+	char	   *message;		/* primary error message (translated) */
+	char	   *detail;			/* detail error message */
+	char	   *detail_log;		/* detail error message for server log only */
+	char	   *hint;			/* hint message */
+	char	   *context;		/* context message */
+	char	   *backtrace;		/* backtrace */
+	const char *message_id;		/* primary message's id (original string) */
+	char	   *schema_name;	/* name of schema */
+	char	   *table_name;		/* name of table */
+	char	   *column_name;	/* name of column */
+	char	   *datatype_name;	/* name of datatype */
+	char	   *constraint_name;	/* name of constraint */
+	int			cursorpos;		/* cursor index into query string */
+	int			internalpos;	/* cursor index into internalquery */
+	char	   *internalquery;	/* text of internally-generated query */
+	int			saved_errno;	/* errno at entry */
 
     /* context containing associated non-constant strings */
     struct MemoryContextData *assoc_context;

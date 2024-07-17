@@ -46,7 +46,7 @@
 
 <programlisting>
 CREATE VIEW myview AS
-    SELECT city, temp_lo, temp_hi, prcp, date, location
+    SELECT name, temp_lo, temp_hi, prcp, date, location
         FROM weather, cities
         WHERE city = name;
 
@@ -101,12 +101,12 @@ SELECT * FROM myview;
 
 <programlisting>
 CREATE TABLE cities (
-        city     varchar(80) primary key,
+        name     varchar(80) primary key,
         location point
 );
 
 CREATE TABLE weather (
-        city      varchar(80) references cities(city),
+        city      varchar(80) references cities(name),
         temp_lo   int,
         temp_hi   int,
         prcp      real,
@@ -616,7 +616,7 @@ CREATE TABLE cities (
 );
 
 CREATE TABLE capitals (
-  state      char(2)
+  state      char(2) UNIQUE NOT NULL
 ) INHERITS (cities);
 </programlisting>
    </para>
@@ -628,8 +628,10 @@ CREATE TABLE capitals (
     <firstterm>parent</firstterm>, <classname>cities</classname>.  The
     type of the column <structfield>name</structfield> is
     <type>text</type>, a native <productname>PostgreSQL</productname>
-    type for variable length character strings.  State capitals have
-    an extra column, <structfield>state</structfield>, that shows their state.  In
+    type for variable length character strings.  The
+    <classname>capitals</classname> table has
+    an additional column, <structfield>state</structfield>, which shows its
+    state abbreviation.  In
     <productname>PostgreSQL</productname>, a table can inherit from
     zero or more other tables.
    </para>
