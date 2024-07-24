@@ -50,7 +50,7 @@
  */
 #define EXTENSION_DONT_CHECK_SIZE	(1 << 4)
 
-#define PRIMARY_NODE_IP ("10.145.21.36")
+#define PRIMARY_NODE_IP ("127.0.0.1")
 #define BLCKSZ 8192
 
 using namespace std;
