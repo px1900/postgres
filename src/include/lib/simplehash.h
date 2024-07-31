@@ -86,6 +86,11 @@
  *	  presence is relevant to determine whether a lookup needs to continue
  *	  looking or is done - buckets following a deleted element are shifted
  *	  backwards, unless they're empty or already at their optimal position.
+ *
+ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * src/include/lib/simplehash.h
  */
 
 #include "port/pg_bitutils.h"
@@ -288,7 +293,8 @@ SH_SCOPE void SH_STAT(SH_TYPE * tb);
 #define SIMPLEHASH_H
 
 #ifdef FRONTEND
-#define sh_error(...) pg_log_error(__VA_ARGS__)
+#define sh_error(...) \
+	do { pg_log_fatal(__VA_ARGS__); exit(1); } while(0)
 #define sh_log(...) pg_log_info(__VA_ARGS__)
 #else
 #define sh_error(...) elog(ERROR, __VA_ARGS__)
@@ -317,7 +323,7 @@ SH_COMPUTE_PARAMETERS(SH_TYPE * tb, uint64 newsize)
 	 * Verify that allocation of ->data is possible on this platform, without
 	 * overflowing Size.
 	 */
-	if ((((uint64) sizeof(SH_ELEMENT_TYPE)) * size) >= SIZE_MAX / 2)
+	if (unlikely((((uint64) sizeof(SH_ELEMENT_TYPE)) * size) >= SIZE_MAX / 2))
 		sh_error("hash table too large");
 
 	/* now set size */
@@ -431,9 +437,9 @@ SH_CREATE(MemoryContext ctx, uint32 nelements, void *private_data)
 	uint64		size;
 
 #ifdef SH_RAW_ALLOCATOR
-	tb = SH_RAW_ALLOCATOR(sizeof(SH_TYPE));
+	tb = (SH_TYPE *) SH_RAW_ALLOCATOR(sizeof(SH_TYPE));
 #else
-	tb = MemoryContextAllocZero(ctx, sizeof(SH_TYPE));
+	tb = (SH_TYPE *) MemoryContextAllocZero(ctx, sizeof(SH_TYPE));
 	tb->ctx = ctx;
 #endif
 	tb->private_data = private_data;
@@ -443,7 +449,7 @@ SH_CREATE(MemoryContext ctx, uint32 nelements, void *private_data)
 
 	SH_COMPUTE_PARAMETERS(tb, size);
 
-	tb->data = SH_ALLOCATE(tb, sizeof(SH_ELEMENT_TYPE) * tb->size);
+	tb->data = (SH_ELEMENT_TYPE *) SH_ALLOCATE(tb, sizeof(SH_ELEMENT_TYPE) * tb->size);
 
 	return tb;
 }
@@ -488,7 +494,7 @@ SH_GROW(SH_TYPE * tb, uint64 newsize)
 	/* compute parameters for new table */
 	SH_COMPUTE_PARAMETERS(tb, newsize);
 
-	tb->data = SH_ALLOCATE(tb, sizeof(SH_ELEMENT_TYPE) * tb->size);
+	tb->data = (SH_ELEMENT_TYPE *) SH_ALLOCATE(tb, sizeof(SH_ELEMENT_TYPE) * tb->size);
 
 	newdata = tb->data;
 
@@ -602,10 +608,8 @@ restart:
 	 */
 	if (unlikely(tb->members >= tb->grow_threshold))
 	{
-		if (tb->size == SH_MAX_SIZE)
-		{
+		if (unlikely(tb->size == SH_MAX_SIZE))
 			sh_error("hash table size exceeded");
-		}
 
 		/*
 		 * When optimizing, it can be very useful to print these out.
@@ -961,7 +965,6 @@ SH_DELETE_ITEM(SH_TYPE * tb, SH_ELEMENT_TYPE * entry)
 SH_SCOPE void
 SH_START_ITERATE(SH_TYPE * tb, SH_ITERATOR * iter)
 {
-	int			i;
 	uint64		startelem = PG_UINT64_MAX;
 
 	/*
@@ -969,7 +972,7 @@ SH_START_ITERATE(SH_TYPE * tb, SH_ITERATOR * iter)
 	 * supported, we want to start/end at an element that cannot be affected
 	 * by elements being shifted.
 	 */
-	for (i = 0; i < tb->size; i++)
+	for (uint32 i = 0; i < tb->size; i++)
 	{
 		SH_ELEMENT_TYPE *entry = &tb->data[i];
 
@@ -980,6 +983,7 @@ SH_START_ITERATE(SH_TYPE * tb, SH_ITERATOR * iter)
 		}
 	}
 
+	/* we should have found an empty element */
 	Assert(startelem < SH_MAX_SIZE);
 
 	/*
@@ -1056,7 +1060,7 @@ SH_STAT(SH_TYPE * tb)
 	double		fillfactor;
 	uint32		i;
 
-	uint32	   *collisions = palloc0(tb->size * sizeof(uint32));
+	uint32	   *collisions = (uint32 *) palloc0(tb->size * sizeof(uint32));
 	uint32		total_collisions = 0;
 	uint32		max_collisions = 0;
 	double		avg_collisions;

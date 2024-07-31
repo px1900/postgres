@@ -159,7 +159,7 @@ PostgreSQL documentation
        Patterns may be unqualified, e.g. <literal>myrel*</literal>, or they
        may be schema-qualified, e.g. <literal>myschema*.myrel*</literal> or
        database-qualified and schema-qualified, e.g.
-       <literal>mydb*.myscheam*.myrel*</literal>. A database-qualified
+       <literal>mydb*.myschema*.myrel*</literal>. A database-qualified
        pattern will add matching databases to the list of databases to be
        checked.
       </para>
@@ -431,6 +431,18 @@ PostgreSQL documentation
     </varlistentry>
    </variablelist>
   </para>
+
+  <warning>
+   <para>
+    The extra checks performed against B-tree indexes when the
+    <option>--parent-check</option> option or the
+    <option>--rootdescend</option> option is specified require
+    relatively strong relation-level locks.  These checks are the only
+    checks that will block concurrent data modification from
+    <command>INSERT</command>, <command>UPDATE</command>, and
+    <command>DELETE</command> commands.
+   </para>
+  </warning>
 
   <para>
    The following command-line options control the connection to the server:

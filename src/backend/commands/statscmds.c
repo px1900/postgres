@@ -184,6 +184,10 @@ CreateStatistics(CreateStatsStmt *stmt)
 	{
 		if (stmt->if_not_exists)
 		{
+			/*
+			 * Since stats objects aren't members of extensions (see comments
+			 * below), no need for checkMembershipInCurrentExtension here.
+			 */
 			ereport(NOTICE,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
 					 errmsg("statistics object \"%s\" already exists, skipping",
@@ -559,11 +563,11 @@ CreateStatistics(CreateStatsStmt *stmt)
 	}
 
 	/*
-	 * If there are no dependencies on a column, give the statistics an auto
-	 * dependency on the whole table.  In most cases, this will be redundant,
-	 * but it might not be if the statistics expressions contain no Vars
-	 * (which might seem strange but possible). This is consistent with what
-	 * we do for indexes in index_create.
+	 * If there are no dependencies on a column, give the statistics object an
+	 * auto dependency on the whole table.  In most cases, this will be
+	 * redundant, but it might not be if the statistics expressions contain no
+	 * Vars (which might seem strange but possible). This is consistent with
+	 * what we do for indexes in index_create.
 	 *
 	 * XXX We intentionally don't consider the expressions before adding this
 	 * dependency, because recordDependencyOnSingleRelExpr may not create any
@@ -648,9 +652,9 @@ AlterStatistics(AlterStatsStmt *stmt)
 	stxoid = get_statistics_object_oid(stmt->defnames, stmt->missing_ok);
 
 	/*
-	 * If we got here and the OID is not valid, it means the statistics does
-	 * not exist, but the command specified IF EXISTS. So report this as a
-	 * simple NOTICE and we're done.
+	 * If we got here and the OID is not valid, it means the statistics object
+	 * does not exist, but the command specified IF EXISTS. So report this as
+	 * a simple NOTICE and we're done.
 	 */
 	if (!OidIsValid(stxoid))
 	{
@@ -677,6 +681,8 @@ AlterStatistics(AlterStatsStmt *stmt)
 	rel = table_open(StatisticExtRelationId, RowExclusiveLock);
 
 	oldtup = SearchSysCache1(STATEXTOID, ObjectIdGetDatum(stxoid));
+	if (!HeapTupleIsValid(oldtup))
+		elog(ERROR, "cache lookup failed for extended statistics object %u", stxoid);
 
 	/* Must be owner of the existing statistics object */
 	if (!pg_statistics_object_ownercheck(stxoid, GetUserId()))
@@ -716,20 +722,14 @@ AlterStatistics(AlterStatsStmt *stmt)
 }
 
 /*
- * Guts of statistics object deletion.
- */
-void
-RemoveStatisticsById(Oid statsOid)
+ * Delete entry in pg_statistic_ext_data catalog.
+*/
+static void
+RemoveStatisticsDataById(Oid statsOid)
 {
 	Relation	relation;
 	HeapTuple	tup;
-	Form_pg_statistic_ext statext;
-	Oid			relid;
 
-	/*
-	 * First delete the pg_statistic_ext_data tuple holding the actual
-	 * statistical data.
-	 */
 	relation = table_open(StatisticExtDataRelationId, RowExclusiveLock);
 
 	tup = SearchSysCache1(STATEXTDATASTXOID, ObjectIdGetDatum(statsOid));
@@ -742,6 +742,19 @@ RemoveStatisticsById(Oid statsOid)
 	ReleaseSysCache(tup);
 
 	table_close(relation, RowExclusiveLock);
+}
+
+/*
+ * Guts of statistics object deletion.
+ */
+void
+RemoveStatisticsById(Oid statsOid)
+{
+	Relation	relation;
+	Relation	rel;
+	HeapTuple	tup;
+	Form_pg_statistic_ext statext;
+	Oid			relid;
 
 	/*
 	 * Delete the pg_statistic_ext tuple.  Also send out a cache inval on the
@@ -757,17 +770,29 @@ RemoveStatisticsById(Oid statsOid)
 	statext = (Form_pg_statistic_ext) GETSTRUCT(tup);
 	relid = statext->stxrelid;
 
+	/*
+	 * Delete the pg_statistic_ext_data tuple holding the actual statistical
+	 * data. We lock the user table first, to prevent other processes (e.g.
+	 * DROP STATISTICS) from removing the row concurrently.
+	 */
+	rel = table_open(relid, ShareUpdateExclusiveLock);
+
+	RemoveStatisticsDataById(statsOid);
+
 	CacheInvalidateRelcacheByRelid(relid);
 
 	CatalogTupleDelete(relation, &tup->t_self);
 
 	ReleaseSysCache(tup);
 
+	/* Keep lock until the end of the transaction. */
+	table_close(rel, NoLock);
+
 	table_close(relation, RowExclusiveLock);
 }
 
 /*
- * Select a nonconflicting name for a new statistics.
+ * Select a nonconflicting name for a new statistics object.
  *
  * name1, name2, and label are used the same way as for makeObjectName(),
  * except that the label can't be NULL; digits will be appended to the label
@@ -814,9 +839,9 @@ ChooseExtendedStatisticName(const char *name1, const char *name2,
 }
 
 /*
- * Generate "name2" for a new statistics given the list of column names for it
- * This will be passed to ChooseExtendedStatisticName along with the parent
- * table name and a suitable label.
+ * Generate "name2" for a new statistics object given the list of column
+ * names for it.  This will be passed to ChooseExtendedStatisticName along
+ * with the parent table name and a suitable label.
  *
  * We know that less than NAMEDATALEN characters will actually be used,
  * so we can truncate the result once we've generated that many.
@@ -868,8 +893,8 @@ ChooseExtendedStatisticNameAddition(List *exprs)
 }
 
 /*
- * StatisticsGetRelation: given a statistics's relation OID, get the OID of
- * the relation it is an statistics on.  Uses the system cache.
+ * StatisticsGetRelation: given a statistics object's OID, get the OID of
+ * the relation it is defined on.  Uses the system cache.
  */
 Oid
 StatisticsGetRelation(Oid statId, bool missing_ok)

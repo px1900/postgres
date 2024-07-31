@@ -508,8 +508,8 @@ BeginCopyTo(ParseState *pstate,
 		/*
 		 * With row-level security and a user using "COPY relation TO", we
 		 * have to convert the "COPY relation TO" to a query-based COPY (eg:
-		 * "COPY (SELECT * FROM relation) TO"), to allow the rewriter to add
-		 * in any RLS clauses.
+		 * "COPY (SELECT * FROM ONLY relation) TO"), to allow the rewriter to
+		 * add in any RLS clauses.
 		 *
 		 * When this happens, we are passed in the relid of the originally
 		 * found relation (which we have locked).  As the planner will look up
@@ -656,8 +656,6 @@ BeginCopyTo(ParseState *pstate,
 	cstate->encoding_embeds_ascii = PG_ENCODING_IS_CLIENT_ONLY(cstate->file_encoding);
 
 	cstate->copy_dest = COPY_FILE;	/* default */
-
-	MemoryContextSwitchTo(oldcontext);
 
 	if (pipe)
 	{

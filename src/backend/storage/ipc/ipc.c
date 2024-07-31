@@ -107,6 +107,10 @@ proc_exit(int code)
     printf("%s Start, pid = %d\n", __func__ , getpid());
     fflush(stdout);
     RpcTransportClose();
+	/* not safe if forked by system(), etc. */
+	if (MyProcPid != (int) getpid())
+		elog(PANIC, "proc_exit() called in child process");
+
 	/* Clean up everything that must be cleaned up */
 	proc_exit_prepare(code);
 

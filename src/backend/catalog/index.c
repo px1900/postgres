@@ -54,6 +54,7 @@
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
+#include "catalog/storage_xlog.h"
 #include "commands/event_trigger.h"
 #include "commands/progress.h"
 #include "commands/tablecmds.h"
@@ -73,6 +74,7 @@
 #include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
@@ -1365,6 +1367,15 @@ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId,
 		newInfo->ii_IndexAttrNumbers[i] = oldInfo->ii_IndexAttrNumbers[i];
 	}
 
+	/* Extract opclass parameters for each attribute, if any */
+	if (oldInfo->ii_OpclassOptions != NULL)
+	{
+		newInfo->ii_OpclassOptions = palloc0(sizeof(Datum) *
+											 newInfo->ii_NumIndexAttrs);
+		for (int i = 0; i < newInfo->ii_NumIndexAttrs; i++)
+			newInfo->ii_OpclassOptions[i] = get_attoptions(oldIndexId, i + 1);
+	}
+
 	/*
 	 * Now create the new index.
 	 *
@@ -1414,6 +1425,9 @@ index_concurrently_build(Oid heapRelationId,
 						 Oid indexRelationId)
 {
 	Relation	heapRel;
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
 	Relation	indexRelation;
 	IndexInfo  *indexInfo;
 
@@ -1423,7 +1437,16 @@ index_concurrently_build(Oid heapRelationId,
 	/* Open and lock the parent heap relation */
 	heapRel = table_open(heapRelationId, ShareUpdateExclusiveLock);
 
-	/* And the target index relation */
+	/*
+	 * Switch to the table owner's userid, so that any index functions are run
+	 * as that user.  Also lock down security-restricted operations and
+	 * arrange to make GUC variable changes local to this command.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(heapRel->rd_rel->relowner,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+	save_nestlevel = NewGUCNestLevel();
+
 	indexRelation = index_open(indexRelationId, RowExclusiveLock);
 
 	/*
@@ -1438,6 +1461,12 @@ index_concurrently_build(Oid heapRelationId,
 
 	/* Now build the index */
 	index_build(heapRel, indexRelation, indexInfo, false, true);
+
+	/* Roll back any GUC changes executed by index functions */
+	AtEOXact_GUC(false, save_nestlevel);
+
+	/* Restore userid and security context */
+	SetUserIdAndSecContext(save_userid, save_sec_context);
 
 	/* Close both the relations, but keep the locks */
 	table_close(heapRel, NoLock);
@@ -2040,6 +2069,7 @@ index_constraint_create(Relation heapRelation,
 		HeapTuple	indexTuple;
 		Form_pg_index indexForm;
 		bool		dirty = false;
+		bool		marked_as_primary = false;
 
 		pg_index = table_open(IndexRelationId, RowExclusiveLock);
 
@@ -2053,6 +2083,7 @@ index_constraint_create(Relation heapRelation,
 		{
 			indexForm->indisprimary = true;
 			dirty = true;
+			marked_as_primary = true;
 		}
 
 		if (deferrable && indexForm->indimmediate)
@@ -2064,6 +2095,15 @@ index_constraint_create(Relation heapRelation,
 		if (dirty)
 		{
 			CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
+
+			/*
+			 * When we mark an existing index as primary, force a relcache
+			 * flush on its parent table, so that all sessions will become
+			 * aware that the table now has a primary key.  This is important
+			 * because it affects some replication behaviors.
+			 */
+			if (marked_as_primary)
+				CacheInvalidateRelcache(heapRelation);
 
 			InvokeObjectPostAlterHookArg(IndexRelationId, indexRelationId, 0,
 										 InvalidOid, is_internal);
@@ -2504,7 +2544,7 @@ CompareIndexInfo(IndexInfo *info1, IndexInfo *info2,
 
 	/*
 	 * and columns match through the attribute map (actual attribute numbers
-	 * might differ!)  Note that this implies that index columns that are
+	 * might differ!)  Note that this checks that index columns that are
 	 * expressions appear in the same positions.  We will next compare the
 	 * expressions themselves.
 	 */
@@ -2513,13 +2553,22 @@ CompareIndexInfo(IndexInfo *info1, IndexInfo *info2,
 		if (attmap->maplen < info2->ii_IndexAttrNumbers[i])
 			elog(ERROR, "incorrect attribute map");
 
-		/* ignore expressions at this stage */
-		if ((info1->ii_IndexAttrNumbers[i] != InvalidAttrNumber) &&
-			(attmap->attnums[info2->ii_IndexAttrNumbers[i] - 1] !=
-			 info1->ii_IndexAttrNumbers[i]))
-			return false;
+		/* ignore expressions for now (but check their collation/opfamily) */
+		if (!(info1->ii_IndexAttrNumbers[i] == InvalidAttrNumber &&
+			  info2->ii_IndexAttrNumbers[i] == InvalidAttrNumber))
+		{
+			/* fail if just one index has an expression in this column */
+			if (info1->ii_IndexAttrNumbers[i] == InvalidAttrNumber ||
+				info2->ii_IndexAttrNumbers[i] == InvalidAttrNumber)
+				return false;
 
-		/* collation and opfamily is not valid for including columns */
+			/* both are columns, so check for match after mapping */
+			if (attmap->attnums[info2->ii_IndexAttrNumbers[i] - 1] !=
+				info1->ii_IndexAttrNumbers[i])
+				return false;
+		}
+
+		/* collation and opfamily are not valid for included columns */
 		if (i >= info1->ii_NumIndexKeyAttrs)
 			continue;
 
@@ -2982,10 +3031,10 @@ index_build(Relation heapRelation,
 	 * relfilenode won't change, and nothing needs to be done here.
 	 */
 	if (indexRelation->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED &&
-		!smgrexists(indexRelation->rd_smgr, INIT_FORKNUM))
+		!smgrexists(RelationGetSmgr(indexRelation), INIT_FORKNUM))
 	{
-		RelationOpenSmgr(indexRelation);
-		smgrcreate(indexRelation->rd_smgr, INIT_FORKNUM, false);
+		smgrcreate(RelationGetSmgr(indexRelation), INIT_FORKNUM, false);
+		log_smgrcreate(&indexRelation->rd_node, INIT_FORKNUM);
 		indexRelation->rd_indam->ambuildempty(indexRelation);
 	}
 
@@ -3273,7 +3322,17 @@ validate_index(Oid heapId, Oid indexId, Snapshot snapshot)
 
 	/* Open and lock the parent heap relation */
 	heapRelation = table_open(heapId, ShareUpdateExclusiveLock);
-	/* And the target index relation */
+
+	/*
+	 * Switch to the table owner's userid, so that any index functions are run
+	 * as that user.  Also lock down security-restricted operations and
+	 * arrange to make GUC variable changes local to this command.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+	save_nestlevel = NewGUCNestLevel();
+
 	indexRelation = index_open(indexId, RowExclusiveLock);
 
 	/*
@@ -3285,16 +3344,6 @@ validate_index(Oid heapId, Oid indexId, Snapshot snapshot)
 
 	/* mark build is concurrent just for consistency */
 	indexInfo->ii_Concurrent = true;
-
-	/*
-	 * Switch to the table owner's userid, so that any index functions are run
-	 * as that user.  Also lock down security-restricted operations and
-	 * arrange to make GUC variable changes local to this command.
-	 */
-	GetUserIdAndSecContext(&save_userid, &save_sec_context);
-	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
-						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
-	save_nestlevel = NewGUCNestLevel();
 
 	/*
 	 * Scan the index and gather up all the TIDs into a tuplesort object.
@@ -3436,9 +3485,8 @@ index_set_state_flags(Oid indexId, IndexStateFlagsAction action)
 			 * CONCURRENTLY that failed partway through.)
 			 *
 			 * Note: the CLUSTER logic assumes that indisclustered cannot be
-			 * set on any invalid index, so clear that flag too.  Similarly,
-			 * ALTER TABLE assumes that indisreplident cannot be set for
-			 * invalid indexes.
+			 * set on any invalid index, so clear that flag too.  For
+			 * cleanliness, also clear indisreplident.
 			 */
 			indexForm->indisvalid = false;
 			indexForm->indisclustered = false;
@@ -3504,6 +3552,9 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 	Relation	iRel,
 				heapRelation;
 	Oid			heapId;
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
 	IndexInfo  *indexInfo;
 	volatile bool skipped_constraint = false;
 	PGRUsage	ru0;
@@ -3531,6 +3582,16 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 	if (!heapRelation)
 		return;
 
+	/*
+	 * Switch to the table owner's userid, so that any index functions are run
+	 * as that user.  Also lock down security-restricted operations and
+	 * arrange to make GUC variable changes local to this command.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+	save_nestlevel = NewGUCNestLevel();
+
 	if (progress)
 	{
 		const int	progress_cols[] = {
@@ -3551,7 +3612,24 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 	 * Open the target index relation and get an exclusive lock on it, to
 	 * ensure that no one else is touching this particular index.
 	 */
-	iRel = index_open(indexId, AccessExclusiveLock);
+	if ((params->options & REINDEXOPT_MISSING_OK) != 0)
+		iRel = try_index_open(indexId, AccessExclusiveLock);
+	else
+		iRel = index_open(indexId, AccessExclusiveLock);
+
+	/* if index relation is gone, leave */
+	if (!iRel)
+	{
+		/* Roll back any GUC changes */
+		AtEOXact_GUC(false, save_nestlevel);
+
+		/* Restore userid and security context */
+		SetUserIdAndSecContext(save_userid, save_sec_context);
+
+		/* Close parent heap relation, but keep locks */
+		table_close(heapRelation, NoLock);
+		return;
+	}
 
 	if (progress)
 		pgstat_progress_update_param(PROGRESS_CREATEIDX_ACCESS_METHOD_OID,
@@ -3749,12 +3827,18 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 				 errdetail_internal("%s",
 									pg_rusage_show(&ru0))));
 
-	if (progress)
-		pgstat_progress_end_command();
+	/* Roll back any GUC changes executed by index functions */
+	AtEOXact_GUC(false, save_nestlevel);
+
+	/* Restore userid and security context */
+	SetUserIdAndSecContext(save_userid, save_sec_context);
 
 	/* Close rels, but keep locks */
 	index_close(iRel, NoLock);
 	table_close(heapRelation, NoLock);
+
+	if (progress)
+		pgstat_progress_end_command();
 }
 
 /*

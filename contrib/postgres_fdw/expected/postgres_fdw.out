@@ -738,10 +738,10 @@ EXPLAIN (VERBOSE, COSTS OFF)
          Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" WHERE (($1::integer = "C 1"))
 (8 rows)
 
-SELECT * FROM ft2 a, ft2 b WHERE a.c1 = 47 AND b.c1 = a.c2;
- c1 | c2 |  c3   |              c4              |            c5            | c6 |     c7     | c8  | c1 | c2 |  c3   |              c4              |            c5            | c6 |     c7     | c8  
-----+----+-------+------------------------------+--------------------------+----+------------+-----+----+----+-------+------------------------------+--------------------------+----+------------+-----
- 47 |  7 | 00047 | Tue Feb 17 00:00:00 1970 PST | Tue Feb 17 00:00:00 1970 | 7  | 7          | foo |  7 |  7 | 00007 | Thu Jan 08 00:00:00 1970 PST | Thu Jan 08 00:00:00 1970 | 7  | 7          | foo
+SELECT * FROM "S 1"."T 1" a, ft2 b WHERE a."C 1" = 47 AND b.c1 = a.c2;
+ C 1 | c2 |  c3   |              c4              |            c5            | c6 |     c7     | c8  | c1 | c2 |  c3   |              c4              |            c5            | c6 |     c7     | c8  
+-----+----+-------+------------------------------+--------------------------+----+------------+-----+----+----+-------+------------------------------+--------------------------+----+------------+-----
+  47 |  7 | 00047 | Tue Feb 17 00:00:00 1970 PST | Tue Feb 17 00:00:00 1970 | 7  | 7          | foo |  7 |  7 | 00007 | Thu Jan 08 00:00:00 1970 PST | Thu Jan 08 00:00:00 1970 | 7  | 7          | foo
 (1 row)
 
 -- check both safe and unsafe join conditions
@@ -1065,6 +1065,26 @@ SELECT * FROM ft1 t1 WHERE t1.c1 === t1.c2 order by t1.c2 limit 1;
  c1 | c2 |  c3   |              c4              |            c5            | c6 |     c7     | c8  
 ----+----+-------+------------------------------+--------------------------+----+------------+-----
   1 |  1 | 00001 | Fri Jan 02 00:00:00 1970 PST | Fri Jan 02 00:00:00 1970 | 1  | 1          | foo
+(1 row)
+
+-- check schema-qualification of regconfig constant
+CREATE TEXT SEARCH CONFIGURATION public.custom_search
+  (COPY = pg_catalog.english);
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT c1, to_tsvector('custom_search'::regconfig, c3) FROM ft1
+WHERE c1 = 642 AND length(to_tsvector('custom_search'::regconfig, c3)) > 0;
+                                                                  QUERY PLAN                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on public.ft1
+   Output: c1, to_tsvector('custom_search'::regconfig, c3)
+   Remote SQL: SELECT "C 1", c3 FROM "S 1"."T 1" WHERE (("C 1" = 642)) AND ((length(to_tsvector('public.custom_search'::regconfig, c3)) > 0))
+(3 rows)
+
+SELECT c1, to_tsvector('custom_search'::regconfig, c3) FROM ft1
+WHERE c1 = 642 AND length(to_tsvector('custom_search'::regconfig, c3)) > 0;
+ c1  | to_tsvector 
+-----+-------------
+ 642 | '00642':1
 (1 row)
 
 -- ===================================================================
@@ -2151,6 +2171,7 @@ SELECT t1."C 1" FROM "S 1"."T 1" t1, LATERAL (SELECT DISTINCT t2.c1, t3.c1 FROM 
                Output: t1."C 1", t1.c2, t1.c3, t1.c4, t1.c5, t1.c6, t1.c7, t1.c8
          ->  Memoize
                Cache Key: t1.c2
+               Cache Mode: binary
                ->  Subquery Scan on q
                      ->  HashAggregate
                            Output: t2.c1, t3.c1
@@ -2159,7 +2180,7 @@ SELECT t1."C 1" FROM "S 1"."T 1" t1, LATERAL (SELECT DISTINCT t2.c1, t3.c1 FROM 
                                  Output: t2.c1, t3.c1
                                  Relations: (public.ft1 t2) INNER JOIN (public.ft2 t3)
                                  Remote SQL: SELECT r1."C 1", r2."C 1" FROM ("S 1"."T 1" r1 INNER JOIN "S 1"."T 1" r2 ON (((r1."C 1" = r2."C 1")) AND ((r1.c2 = $1::integer))))
-(16 rows)
+(17 rows)
 
 SELECT t1."C 1" FROM "S 1"."T 1" t1, LATERAL (SELECT DISTINCT t2.c1, t3.c1 FROM ft1 t2, ft2 t3 WHERE t2.c1 = t3.c1 AND t2.c2 = t1.c2) q ORDER BY t1."C 1" OFFSET 10 LIMIT 10;
  C 1 
@@ -2175,6 +2196,32 @@ SELECT t1."C 1" FROM "S 1"."T 1" t1, LATERAL (SELECT DISTINCT t2.c1, t3.c1 FROM 
    1
    1
 (10 rows)
+
+-- join with pseudoconstant quals, not pushed down.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT t1.c1, t2.c1 FROM ft1 t1 JOIN ft2 t2 ON (t1.c1 = t2.c1 AND CURRENT_USER = SESSION_USER) ORDER BY t1.c3, t1.c1 OFFSET 100 LIMIT 10;
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Limit
+   Output: t1.c1, t2.c1, t1.c3
+   ->  Sort
+         Output: t1.c1, t2.c1, t1.c3
+         Sort Key: t1.c3, t1.c1
+         ->  Result
+               Output: t1.c1, t2.c1, t1.c3
+               One-Time Filter: (CURRENT_USER = SESSION_USER)
+               ->  Hash Join
+                     Output: t1.c1, t1.c3, t2.c1
+                     Hash Cond: (t2.c1 = t1.c1)
+                     ->  Foreign Scan on public.ft2 t2
+                           Output: t2.c1
+                           Remote SQL: SELECT "C 1" FROM "S 1"."T 1"
+                     ->  Hash
+                           Output: t1.c1, t1.c3
+                           ->  Foreign Scan on public.ft1 t1
+                                 Output: t1.c1, t1.c3
+                                 Remote SQL: SELECT "C 1", c3 FROM "S 1"."T 1"
+(19 rows)
 
 -- non-Var items in targetlist of the nullable rel of a join preventing
 -- push-down in some cases
@@ -2334,6 +2381,85 @@ SELECT * FROM ft1, ft2, ft4, ft5, local_tbl WHERE ft1.c1 = ft2.c1 AND ft1.c2 = f
 
 RESET enable_nestloop;
 RESET enable_hashjoin;
+-- test that add_paths_with_pathkeys_for_rel() arranges for the epq_path to
+-- return columns needed by the parent ForeignScan node
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM local_tbl LEFT JOIN (SELECT ft1.*, COALESCE(ft1.c3 || ft2.c3, 'foobar') FROM ft1 INNER JOIN ft2 ON (ft1.c1 = ft2.c1 AND ft1.c1 < 100)) ss ON (local_tbl.c1 = ss.c1) ORDER BY local_tbl.c1 FOR UPDATE OF local_tbl;
+                                                                                                                                                                                                                              QUERY PLAN                                                                                                                                                                                                                              
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ LockRows
+   Output: local_tbl.c1, local_tbl.c2, local_tbl.c3, ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, (COALESCE((ft1.c3 || ft2.c3), 'foobar'::text)), local_tbl.ctid, ft1.*, ft2.*
+   ->  Merge Left Join
+         Output: local_tbl.c1, local_tbl.c2, local_tbl.c3, ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, (COALESCE((ft1.c3 || ft2.c3), 'foobar'::text)), local_tbl.ctid, ft1.*, ft2.*
+         Merge Cond: (local_tbl.c1 = ft1.c1)
+         ->  Index Scan using local_tbl_pkey on public.local_tbl
+               Output: local_tbl.c1, local_tbl.c2, local_tbl.c3, local_tbl.ctid
+         ->  Materialize
+               Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*, ft2.*, (COALESCE((ft1.c3 || ft2.c3), 'foobar'::text))
+               ->  Foreign Scan
+                     Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*, ft2.*, COALESCE((ft1.c3 || ft2.c3), 'foobar'::text)
+                     Relations: (public.ft1) INNER JOIN (public.ft2)
+                     Remote SQL: SELECT r4."C 1", r4.c2, r4.c3, r4.c4, r4.c5, r4.c6, r4.c7, r4.c8, CASE WHEN (r4.*)::text IS NOT NULL THEN ROW(r4."C 1", r4.c2, r4.c3, r4.c4, r4.c5, r4.c6, r4.c7, r4.c8) END, CASE WHEN (r5.*)::text IS NOT NULL THEN ROW(r5."C 1", r5.c2, r5.c3, r5.c4, r5.c5, r5.c6, r5.c7, r5.c8) END, r5.c3 FROM ("S 1"."T 1" r4 INNER JOIN "S 1"."T 1" r5 ON (((r4."C 1" = r5."C 1")) AND ((r4."C 1" < 100)))) ORDER BY r4."C 1" ASC NULLS LAST
+                     ->  Result
+                           Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*, ft2.*, ft2.c3
+                           ->  Sort
+                                 Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*, ft2.*, (COALESCE((ft1.c3 || ft2.c3), 'foobar'::text)), ft2.c3
+                                 Sort Key: ft1.c1
+                                 ->  Hash Join
+                                       Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*, ft2.*, COALESCE((ft1.c3 || ft2.c3), 'foobar'::text), ft2.c3
+                                       Hash Cond: (ft1.c1 = ft2.c1)
+                                       ->  Foreign Scan on public.ft1
+                                             Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*
+                                             Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" WHERE (("C 1" < 100))
+                                       ->  Hash
+                                             Output: ft2.*, ft2.c1, ft2.c3
+                                             ->  Foreign Scan on public.ft2
+                                                   Output: ft2.*, ft2.c1, ft2.c3
+                                                   Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1"
+(29 rows)
+
+ALTER SERVER loopback OPTIONS (DROP extensions);
+ALTER SERVER loopback OPTIONS (ADD fdw_startup_cost '10000.0');
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM local_tbl LEFT JOIN (SELECT ft1.* FROM ft1 INNER JOIN ft2 ON (ft1.c1 = ft2.c1 AND ft1.c1 < 100 AND ft1.c1 = postgres_fdw_abs(ft2.c2))) ss ON (local_tbl.c3 = ss.c3) ORDER BY local_tbl.c1 FOR UPDATE OF local_tbl;
+                                                                                                                                                                                                                            QUERY PLAN                                                                                                                                                                                                                             
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ LockRows
+   Output: local_tbl.c1, local_tbl.c2, local_tbl.c3, ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, local_tbl.ctid, ft1.*, ft2.*
+   ->  Nested Loop Left Join
+         Output: local_tbl.c1, local_tbl.c2, local_tbl.c3, ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, local_tbl.ctid, ft1.*, ft2.*
+         Join Filter: (local_tbl.c3 = ft1.c3)
+         ->  Index Scan using local_tbl_pkey on public.local_tbl
+               Output: local_tbl.c1, local_tbl.c2, local_tbl.c3, local_tbl.ctid
+         ->  Materialize
+               Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*, ft2.*
+               ->  Foreign Scan
+                     Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*, ft2.*
+                     Filter: (ft1.c1 = postgres_fdw_abs(ft2.c2))
+                     Relations: (public.ft1) INNER JOIN (public.ft2)
+                     Remote SQL: SELECT r4."C 1", r4.c2, r4.c3, r4.c4, r4.c5, r4.c6, r4.c7, r4.c8, CASE WHEN (r4.*)::text IS NOT NULL THEN ROW(r4."C 1", r4.c2, r4.c3, r4.c4, r4.c5, r4.c6, r4.c7, r4.c8) END, CASE WHEN (r5.*)::text IS NOT NULL THEN ROW(r5."C 1", r5.c2, r5.c3, r5.c4, r5.c5, r5.c6, r5.c7, r5.c8) END, r5.c2 FROM ("S 1"."T 1" r4 INNER JOIN "S 1"."T 1" r5 ON (((r4."C 1" = r5."C 1")) AND ((r4."C 1" < 100)))) ORDER BY r4.c3 ASC NULLS LAST
+                     ->  Sort
+                           Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*, ft2.*, ft2.c2
+                           Sort Key: ft1.c3
+                           ->  Merge Join
+                                 Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*, ft2.*, ft2.c2
+                                 Merge Cond: ((ft1.c1 = (postgres_fdw_abs(ft2.c2))) AND (ft1.c1 = ft2.c1))
+                                 ->  Sort
+                                       Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*
+                                       Sort Key: ft1.c1
+                                       ->  Foreign Scan on public.ft1
+                                             Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*
+                                             Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" WHERE (("C 1" < 100))
+                                 ->  Sort
+                                       Output: ft2.*, ft2.c1, ft2.c2, (postgres_fdw_abs(ft2.c2))
+                                       Sort Key: (postgres_fdw_abs(ft2.c2)), ft2.c1
+                                       ->  Foreign Scan on public.ft2
+                                             Output: ft2.*, ft2.c1, ft2.c2, postgres_fdw_abs(ft2.c2)
+                                             Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" ORDER BY "C 1" ASC NULLS LAST
+(32 rows)
+
+ALTER SERVER loopback OPTIONS (DROP fdw_startup_cost);
+ALTER SERVER loopback OPTIONS (ADD extensions 'postgres_fdw');
 DROP TABLE local_tbl;
 -- check join pushdown in situations where multiple userids are involved
 CREATE ROLE regress_view_owner SUPERUSER;
@@ -3168,6 +3294,19 @@ select array_agg(c1 order by c1 using operator(public.<^)) from ft2 where c2 = 6
          Remote SQL: SELECT "C 1", c2 FROM "S 1"."T 1" WHERE (("C 1" < 100)) AND ((c2 = 6))
 (6 rows)
 
+-- This should not be pushed either.
+explain (verbose, costs off)
+select * from ft2 order by c1 using operator(public.<^);
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Sort
+   Output: c1, c2, c3, c4, c5, c6, c7, c8
+   Sort Key: ft2.c1 USING <^
+   ->  Foreign Scan on public.ft2
+         Output: c1, c2, c3, c4, c5, c6, c7, c8
+         Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1"
+(6 rows)
+
 -- Update local stats on ft2
 ANALYZE ft2;
 -- Add into extension
@@ -3194,6 +3333,16 @@ select array_agg(c1 order by c1 using operator(public.<^)) from ft2 where c2 = 6
 --------------------------------
  {6,16,26,36,46,56,66,76,86,96}
 (1 row)
+
+-- This should be pushed too.
+explain (verbose, costs off)
+select * from ft2 order by c1 using operator(public.<^);
+                                                         QUERY PLAN                                                          
+-----------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on public.ft2
+   Output: c1, c2, c3, c4, c5, c6, c7, c8
+   Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" ORDER BY "C 1" USING OPERATOR(public.<^) NULLS LAST
+(3 rows)
 
 -- Remove from extension
 alter extension postgres_fdw drop operator class my_op_class using btree;
@@ -4110,6 +4259,9 @@ CONTEXT:  whole-row reference to foreign table "ftx"
 SELECT sum(c2), array_agg(c8) FROM ft1 GROUP BY c8; -- ERROR
 ERROR:  invalid input syntax for type integer: "foo"
 CONTEXT:  processing expression at position 2 in select list
+ANALYZE ft1; -- ERROR
+ERROR:  invalid input syntax for type integer: "foo"
+CONTEXT:  column "c8" of foreign table "ft1"
 ALTER FOREIGN TABLE ft1 ALTER COLUMN c8 TYPE user_enum;
 -- ===================================================================
 -- subtransaction
@@ -6326,6 +6478,29 @@ SELECT * FROM foreign_tbl;
  20 | 30
 (1 row)
 
+-- We don't allow batch insert when there are any WCO constraints
+ALTER SERVER loopback OPTIONS (ADD batch_size '10');
+EXPLAIN (VERBOSE, COSTS OFF)
+INSERT INTO rw_view VALUES (0, 15), (0, 5);
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Insert on public.foreign_tbl
+   Remote SQL: INSERT INTO public.base_tbl(a, b) VALUES ($1, $2) RETURNING a, b
+   Batch Size: 1
+   ->  Values Scan on "*VALUES*"
+         Output: "*VALUES*".column1, "*VALUES*".column2
+(5 rows)
+
+INSERT INTO rw_view VALUES (0, 15), (0, 5); -- should fail
+ERROR:  new row violates check option for view "rw_view"
+DETAIL:  Failing row contains (10, 5).
+SELECT * FROM foreign_tbl;
+ a  | b  
+----+----
+ 20 | 30
+(1 row)
+
+ALTER SERVER loopback OPTIONS (DROP batch_size);
 DROP FOREIGN TABLE foreign_tbl CASCADE;
 NOTICE:  drop cascades to view rw_view
 DROP TRIGGER row_before_insupd_trigger ON base_tbl;
@@ -6337,6 +6512,9 @@ CREATE TRIGGER row_before_insupd_trigger BEFORE INSERT OR UPDATE ON child_tbl FO
 CREATE FOREIGN TABLE foreign_tbl (a int, b int)
   SERVER loopback OPTIONS (table_name 'child_tbl');
 CREATE TABLE parent_tbl (a int, b int) PARTITION BY RANGE(a);
+ALTER TABLE parent_tbl ATTACH PARTITION foreign_tbl FOR VALUES FROM (0) TO (100);
+-- Detach and re-attach once, to stress the concurrent detach case.
+ALTER TABLE parent_tbl DETACH PARTITION foreign_tbl CONCURRENTLY;
 ALTER TABLE parent_tbl ATTACH PARTITION foreign_tbl FOR VALUES FROM (0) TO (100);
 CREATE VIEW rw_view AS SELECT * FROM parent_tbl
   WHERE a < b WITH CHECK OPTION;
@@ -6415,6 +6593,27 @@ SELECT * FROM foreign_tbl;
  20 | 30
 (1 row)
 
+-- We don't allow batch insert when there are any WCO constraints
+ALTER SERVER loopback OPTIONS (ADD batch_size '10');
+EXPLAIN (VERBOSE, COSTS OFF)
+INSERT INTO rw_view VALUES (0, 15), (0, 5);
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Insert on public.parent_tbl
+   ->  Values Scan on "*VALUES*"
+         Output: "*VALUES*".column1, "*VALUES*".column2
+(3 rows)
+
+INSERT INTO rw_view VALUES (0, 15), (0, 5); -- should fail
+ERROR:  new row violates check option for view "rw_view"
+DETAIL:  Failing row contains (10, 5).
+SELECT * FROM foreign_tbl;
+ a  | b  
+----+----
+ 20 | 30
+(1 row)
+
+ALTER SERVER loopback OPTIONS (DROP batch_size);
 DROP FOREIGN TABLE foreign_tbl CASCADE;
 DROP TRIGGER row_before_insupd_trigger ON child_tbl;
 DROP TABLE parent_tbl CASCADE;
@@ -6551,6 +6750,28 @@ select * from grem1;
 (2 rows)
 
 delete from grem1;
+-- batch insert with foreign partitions.
+-- This schema uses two partitions, one local and one remote with a modulo
+-- to loop across all of them in batches.
+create table tab_batch_local (id int, data text);
+insert into tab_batch_local select i, 'test'|| i from generate_series(1, 45) i;
+create table tab_batch_sharded (id int, data text) partition by hash(id);
+create table tab_batch_sharded_p0 partition of tab_batch_sharded
+  for values with (modulus 2, remainder 0);
+create table tab_batch_sharded_p1_remote (id int, data text);
+create foreign table tab_batch_sharded_p1 partition of tab_batch_sharded
+  for values with (modulus 2, remainder 1)
+  server loopback options (table_name 'tab_batch_sharded_p1_remote');
+insert into tab_batch_sharded select * from tab_batch_local;
+select count(*) from tab_batch_sharded;
+ count 
+-------
+    45
+(1 row)
+
+drop table tab_batch_local;
+drop table tab_batch_sharded;
+drop table tab_batch_sharded_p1_remote;
 alter server loopback options (drop batch_size);
 -- ===================================================================
 -- test local triggers
@@ -9441,11 +9662,6 @@ WARNING:  there is no transaction in progress
 -- Change application_name of remote connection to special one
 -- so that we can easily terminate the connection later.
 ALTER SERVER loopback OPTIONS (application_name 'fdw_retry_check');
--- If debug_discard_caches is active, it results in
--- dropping remote connections after every transaction, making it
--- impossible to test termination meaningfully.  So turn that off
--- for this test.
-SET debug_discard_caches = 0;
 -- Make sure we have a remote connection.
 SELECT 1 FROM ft1 LIMIT 1;
  ?column? 
@@ -9454,13 +9670,12 @@ SELECT 1 FROM ft1 LIMIT 1;
 (1 row)
 
 -- Terminate the remote connection and wait for the termination to complete.
-SELECT pg_terminate_backend(pid, 180000) FROM pg_stat_activity
+-- (If a cache flush happens, the remote connection might have already been
+-- dropped; so code this step in a way that doesn't fail if no connection.)
+DO $$ BEGIN
+PERFORM pg_terminate_backend(pid, 180000) FROM pg_stat_activity
 	WHERE application_name = 'fdw_retry_check';
- pg_terminate_backend 
-----------------------
- t
-(1 row)
-
+END $$;
 -- This query should detect the broken connection when starting new remote
 -- transaction, reestablish new connection, and then succeed.
 BEGIN;
@@ -9473,13 +9688,10 @@ SELECT 1 FROM ft1 LIMIT 1;
 -- If we detect the broken connection when starting a new remote
 -- subtransaction, we should fail instead of establishing a new connection.
 -- Terminate the remote connection and wait for the termination to complete.
-SELECT pg_terminate_backend(pid, 180000) FROM pg_stat_activity
+DO $$ BEGIN
+PERFORM pg_terminate_backend(pid, 180000) FROM pg_stat_activity
 	WHERE application_name = 'fdw_retry_check';
- pg_terminate_backend 
-----------------------
- t
-(1 row)
-
+END $$;
 SAVEPOINT s;
 -- The text of the error might vary across platforms, so only show SQLSTATE.
 \set VERBOSITY sqlstate
@@ -9487,7 +9699,6 @@ SELECT 1 FROM ft1 LIMIT 1;    -- should fail
 ERROR:  08006
 \set VERBOSITY default
 COMMIT;
-RESET debug_discard_caches;
 -- =============================================================================
 -- test connection invalidation cases and postgres_fdw_get_connections function
 -- =============================================================================
@@ -9808,17 +10019,6 @@ SELECT COUNT(*) FROM ftable;
 
 TRUNCATE batch_table;
 DROP FOREIGN TABLE ftable;
--- try if large batches exceed max number of bind parameters
-CREATE FOREIGN TABLE ftable ( x int ) SERVER loopback OPTIONS ( table_name 'batch_table', batch_size '100000' );
-INSERT INTO ftable SELECT * FROM generate_series(1, 70000) i;
-SELECT COUNT(*) FROM ftable;
- count 
--------
- 70000
-(1 row)
-
-TRUNCATE batch_table;
-DROP FOREIGN TABLE ftable;
 -- Disable batch insert
 CREATE FOREIGN TABLE ftable ( x int ) SERVER loopback OPTIONS ( table_name 'batch_table', batch_size '1' );
 EXPLAIN (VERBOSE, COSTS OFF) INSERT INTO ftable VALUES (1), (2);
@@ -9838,6 +10038,34 @@ SELECT COUNT(*) FROM ftable;
      2
 (1 row)
 
+-- Disable batch inserting into foreign tables with BEFORE ROW INSERT triggers
+-- even if the batch_size option is enabled.
+ALTER FOREIGN TABLE ftable OPTIONS ( SET batch_size '10' );
+CREATE TRIGGER trig_row_before BEFORE INSERT ON ftable
+FOR EACH ROW EXECUTE PROCEDURE trigger_data(23,'skidoo');
+EXPLAIN (VERBOSE, COSTS OFF) INSERT INTO ftable VALUES (3), (4);
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Insert on public.ftable
+   Remote SQL: INSERT INTO public.batch_table(x) VALUES ($1)
+   Batch Size: 1
+   ->  Values Scan on "*VALUES*"
+         Output: "*VALUES*".column1
+(5 rows)
+
+INSERT INTO ftable VALUES (3), (4);
+NOTICE:  trig_row_before(23, skidoo) BEFORE ROW INSERT ON ftable
+NOTICE:  NEW: (3)
+NOTICE:  trig_row_before(23, skidoo) BEFORE ROW INSERT ON ftable
+NOTICE:  NEW: (4)
+SELECT COUNT(*) FROM ftable;
+ count 
+-------
+     4
+(1 row)
+
+-- Clean up
+DROP TRIGGER trig_row_before ON ftable;
 DROP FOREIGN TABLE ftable;
 DROP TABLE batch_table;
 -- Use partitioning
@@ -9967,7 +10195,130 @@ SELECT * FROM batch_table ORDER BY x;
  50 | test50 | test50
 (50 rows)
 
+-- Clean up
+DROP TABLE batch_table;
+DROP TABLE batch_table_p0;
+DROP TABLE batch_table_p1;
 ALTER SERVER loopback OPTIONS (DROP batch_size);
+-- Test that pending inserts are handled properly when needed
+CREATE TABLE batch_table (a text, b int);
+CREATE FOREIGN TABLE ftable (a text, b int)
+	SERVER loopback
+	OPTIONS (table_name 'batch_table', batch_size '2');
+CREATE TABLE ltable (a text, b int);
+CREATE FUNCTION ftable_rowcount_trigf() RETURNS trigger LANGUAGE plpgsql AS
+$$
+begin
+	raise notice '%: there are % rows in ftable',
+		TG_NAME, (SELECT count(*) FROM ftable);
+	if TG_OP = 'DELETE' then
+		return OLD;
+	else
+		return NEW;
+	end if;
+end;
+$$;
+CREATE TRIGGER ftable_rowcount_trigger
+BEFORE INSERT OR UPDATE OR DELETE ON ltable
+FOR EACH ROW EXECUTE PROCEDURE ftable_rowcount_trigf();
+WITH t AS (
+	INSERT INTO ltable VALUES ('AAA', 42), ('BBB', 42) RETURNING *
+)
+INSERT INTO ftable SELECT * FROM t;
+NOTICE:  ftable_rowcount_trigger: there are 0 rows in ftable
+NOTICE:  ftable_rowcount_trigger: there are 1 rows in ftable
+SELECT * FROM ltable;
+  a  | b  
+-----+----
+ AAA | 42
+ BBB | 42
+(2 rows)
+
+SELECT * FROM ftable;
+  a  | b  
+-----+----
+ AAA | 42
+ BBB | 42
+(2 rows)
+
+DELETE FROM ftable;
+WITH t AS (
+	UPDATE ltable SET b = b + 100 RETURNING *
+)
+INSERT INTO ftable SELECT * FROM t;
+NOTICE:  ftable_rowcount_trigger: there are 0 rows in ftable
+NOTICE:  ftable_rowcount_trigger: there are 1 rows in ftable
+SELECT * FROM ltable;
+  a  |  b  
+-----+-----
+ AAA | 142
+ BBB | 142
+(2 rows)
+
+SELECT * FROM ftable;
+  a  |  b  
+-----+-----
+ AAA | 142
+ BBB | 142
+(2 rows)
+
+DELETE FROM ftable;
+WITH t AS (
+	DELETE FROM ltable RETURNING *
+)
+INSERT INTO ftable SELECT * FROM t;
+NOTICE:  ftable_rowcount_trigger: there are 0 rows in ftable
+NOTICE:  ftable_rowcount_trigger: there are 1 rows in ftable
+SELECT * FROM ltable;
+ a | b 
+---+---
+(0 rows)
+
+SELECT * FROM ftable;
+  a  |  b  
+-----+-----
+ AAA | 142
+ BBB | 142
+(2 rows)
+
+DELETE FROM ftable;
+-- Clean up
+DROP FOREIGN TABLE ftable;
+DROP TABLE batch_table;
+DROP TRIGGER ftable_rowcount_trigger ON ltable;
+DROP TABLE ltable;
+CREATE TABLE parent (a text, b int) PARTITION BY LIST (a);
+CREATE TABLE batch_table (a text, b int);
+CREATE FOREIGN TABLE ftable
+	PARTITION OF parent
+	FOR VALUES IN ('AAA')
+	SERVER loopback
+	OPTIONS (table_name 'batch_table', batch_size '2');
+CREATE TABLE ltable
+	PARTITION OF parent
+	FOR VALUES IN ('BBB');
+CREATE TRIGGER ftable_rowcount_trigger
+BEFORE INSERT ON ltable
+FOR EACH ROW EXECUTE PROCEDURE ftable_rowcount_trigf();
+INSERT INTO parent VALUES ('AAA', 42), ('BBB', 42), ('AAA', 42), ('BBB', 42);
+NOTICE:  ftable_rowcount_trigger: there are 1 rows in ftable
+NOTICE:  ftable_rowcount_trigger: there are 2 rows in ftable
+SELECT tableoid::regclass, * FROM parent;
+ tableoid |  a  | b  
+----------+-----+----
+ ftable   | AAA | 42
+ ftable   | AAA | 42
+ ltable   | BBB | 42
+ ltable   | BBB | 42
+(4 rows)
+
+-- Clean up
+DROP FOREIGN TABLE ftable;
+DROP TABLE batch_table;
+DROP TRIGGER ftable_rowcount_trigger ON ltable;
+DROP TABLE ltable;
+DROP TABLE parent;
+DROP FUNCTION ftable_rowcount_trigf;
 -- ===================================================================
 -- test asynchronous execution
 -- ===================================================================
@@ -10052,6 +10403,13 @@ SELECT * FROM result_tbl ORDER BY a;
 (2 rows)
 
 DELETE FROM result_tbl;
+-- Test error handling, if accessing one of the foreign partitions errors out
+CREATE FOREIGN TABLE async_p_broken PARTITION OF async_pt FOR VALUES FROM (10000) TO (10001)
+  SERVER loopback OPTIONS (table_name 'non_existent_table');
+SELECT * FROM async_pt;
+ERROR:  relation "public.non_existent_table" does not exist
+CONTEXT:  remote SQL command: SELECT a, b, c FROM public.non_existent_table
+DROP FOREIGN TABLE async_p_broken;
 -- Check case where multiple partitions use the same connection
 CREATE TABLE base_tbl3 (a int, b int, c text);
 CREATE FOREIGN TABLE async_p3 PARTITION OF async_pt FOR VALUES FROM (3000) TO (4000)
@@ -10366,6 +10724,32 @@ DROP TABLE local_tbl;
 DROP INDEX base_tbl1_idx;
 DROP INDEX base_tbl2_idx;
 DROP INDEX async_p3_idx;
+-- Disable async execution if we use gating Result nodes for pseudoconstant
+-- quals
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM async_pt WHERE CURRENT_USER = SESSION_USER;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Append
+   ->  Result
+         Output: async_pt_1.a, async_pt_1.b, async_pt_1.c
+         One-Time Filter: (CURRENT_USER = SESSION_USER)
+         ->  Foreign Scan on public.async_p1 async_pt_1
+               Output: async_pt_1.a, async_pt_1.b, async_pt_1.c
+               Remote SQL: SELECT a, b, c FROM public.base_tbl1
+   ->  Result
+         Output: async_pt_2.a, async_pt_2.b, async_pt_2.c
+         One-Time Filter: (CURRENT_USER = SESSION_USER)
+         ->  Foreign Scan on public.async_p2 async_pt_2
+               Output: async_pt_2.a, async_pt_2.b, async_pt_2.c
+               Remote SQL: SELECT a, b, c FROM public.base_tbl2
+   ->  Result
+         Output: async_pt_3.a, async_pt_3.b, async_pt_3.c
+         One-Time Filter: (CURRENT_USER = SESSION_USER)
+         ->  Seq Scan on public.async_p3 async_pt_3
+               Output: async_pt_3.a, async_pt_3.b, async_pt_3.c
+(18 rows)
+
 -- Test that pending requests are processed properly
 SET enable_mergejoin TO false;
 SET enable_hashjoin TO false;
@@ -10650,6 +11034,43 @@ DROP TABLE base_tbl1;
 DROP TABLE base_tbl2;
 DROP TABLE result_tbl;
 DROP TABLE join_tbl;
+-- Test that an asynchronous fetch is processed before restarting the scan in
+-- ReScanForeignScan
+CREATE TABLE base_tbl (a int, b int);
+INSERT INTO base_tbl VALUES (1, 11), (2, 22), (3, 33);
+CREATE FOREIGN TABLE foreign_tbl (b int)
+  SERVER loopback OPTIONS (table_name 'base_tbl');
+CREATE FOREIGN TABLE foreign_tbl2 () INHERITS (foreign_tbl)
+  SERVER loopback OPTIONS (table_name 'base_tbl');
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT a FROM base_tbl WHERE a IN (SELECT a FROM foreign_tbl);
+                                 QUERY PLAN                                  
+-----------------------------------------------------------------------------
+ Seq Scan on public.base_tbl
+   Output: base_tbl.a
+   Filter: (SubPlan 1)
+   SubPlan 1
+     ->  Result
+           Output: base_tbl.a
+           ->  Append
+                 ->  Async Foreign Scan on public.foreign_tbl foreign_tbl_1
+                       Remote SQL: SELECT NULL FROM public.base_tbl
+                 ->  Async Foreign Scan on public.foreign_tbl2 foreign_tbl_2
+                       Remote SQL: SELECT NULL FROM public.base_tbl
+(11 rows)
+
+SELECT a FROM base_tbl WHERE a IN (SELECT a FROM foreign_tbl);
+ a 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+-- Clean up
+DROP FOREIGN TABLE foreign_tbl CASCADE;
+NOTICE:  drop cascades to foreign table foreign_tbl2
+DROP TABLE base_tbl;
 ALTER SERVER loopback OPTIONS (DROP async_capable);
 ALTER SERVER loopback2 OPTIONS (DROP async_capable);
 -- ===================================================================

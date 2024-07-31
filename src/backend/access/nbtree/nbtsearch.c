@@ -17,12 +17,18 @@
 
 #include "access/nbtree.h"
 #include "access/relscan.h"
+#include "access/xact.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/predicate.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
+
+Buffer
+_bt_getbuf_rename(Relation rel, BlockNumber blkno, int access);
+// _bt_getbuf will call _bt_getbuf_rename2() and printf($location)
+#define _bt_getbuf(rel, blkno, access) _bt_getbuf_rename2(rel, blkno, access, __func__, __LINE__)
 
 static void _bt_drop_lock_and_maybe_pin(IndexScanDesc scan, BTScanPos sp);
 static OffsetNumber _bt_binsrch(Relation rel, BTScanInsert key, Buffer buf);
@@ -526,7 +532,24 @@ _bt_binsrch_insert(Relation rel, BTInsertState insertstate)
 		 * infrequently.
 		 */
 		if (unlikely(result == 0 && key->scantid != NULL))
+		{
+			/*
+			 * postingoff should never be set more than once per leaf page
+			 * binary search.  That would mean that there are duplicate table
+			 * TIDs in the index, which is never okay.  Check for that here.
+			 */
+			if (insertstate->postingoff != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg_internal("table tid from new index tuple (%u,%u) cannot find insert offset between offsets %u and %u of block %u in index \"%s\"",
+										 ItemPointerGetBlockNumber(key->scantid),
+										 ItemPointerGetOffsetNumber(key->scantid),
+										 low, stricthigh,
+										 BufferGetBlockNumber(insertstate->buf),
+										 RelationGetRelationName(rel))));
+
 			insertstate->postingoff = _bt_binsrch_posting(key, page, mid);
+		}
 	}
 
 	/*
@@ -1360,22 +1383,34 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 	{
 		/*
 		 * We only get here if the index is completely empty. Lock relation
-		 * because nothing finer to lock exists.
+		 * because nothing finer to lock exists.  Without a buffer lock, it's
+		 * possible for another transaction to insert data between
+		 * _bt_search() and PredicateLockRelation().  We have to try again
+		 * after taking the relation-level predicate lock, to close a narrow
+		 * window where we wouldn't scan concurrently inserted tuples, but the
+		 * writer wouldn't see our predicate lock.
 		 */
-		PredicateLockRelation(rel, scan->xs_snapshot);
+		if (IsolationIsSerializable())
+		{
+			PredicateLockRelation(rel, scan->xs_snapshot);
+			stack = _bt_search(rel, &inskey, &buf, BT_READ,
+							   scan->xs_snapshot);
+			_bt_freestack(stack);
+		}
 
-		/*
-		 * mark parallel scan as done, so that all the workers can finish
-		 * their scan
-		 */
-		_bt_parallel_done(scan);
-		BTScanPosInvalidate(so->currPos);
-
-		return false;
+		if (!BufferIsValid(buf))
+		{
+			/*
+			 * Mark parallel scan as done, so that all the workers can finish
+			 * their scan.
+			 */
+			_bt_parallel_done(scan);
+			BTScanPosInvalidate(so->currPos);
+			return false;
+		}
 	}
-	else
-		PredicateLockPage(rel, BufferGetBlockNumber(buf),
-						  scan->xs_snapshot);
+
+	PredicateLockPage(rel, BufferGetBlockNumber(buf), scan->xs_snapshot);
 
 	_bt_initialize_more_data(so, dir);
 

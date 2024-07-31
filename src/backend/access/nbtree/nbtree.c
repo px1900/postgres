@@ -38,6 +38,12 @@
 #include "utils/memutils.h"
 
 
+
+
+Buffer
+_bt_getbuf_rename(Relation rel, BlockNumber blkno, int access);
+// _bt_getbuf will call _bt_getbuf_rename2() and printf($location)
+#define _bt_getbuf(rel, blkno, access) _bt_getbuf_rename2(rel, blkno, access, __func__, __LINE__)
 /*
  * BTPARALLEL_NOT_INITIALIZED indicates that the scan has not started.
  *
@@ -163,9 +169,9 @@ btbuildempty(Relation index)
 	 * this even when wal_level=minimal.
 	 */
 	PageSetChecksumInplace(metapage, BTREE_METAPAGE);
-	smgrwrite(index->rd_smgr, INIT_FORKNUM, BTREE_METAPAGE,
+	smgrwrite(RelationGetSmgr(index), INIT_FORKNUM, BTREE_METAPAGE,
 			  (char *) metapage, true);
-	log_newpage(&index->rd_smgr->smgr_rnode.node, INIT_FORKNUM,
+	log_newpage(&RelationGetSmgr(index)->smgr_rnode.node, INIT_FORKNUM,
 				BTREE_METAPAGE, metapage, true);
 
 	/*
@@ -173,7 +179,7 @@ btbuildempty(Relation index)
 	 * write did not go through shared_buffers and therefore a concurrent
 	 * checkpoint may have moved the redo pointer past our xlog record.
 	 */
-	smgrimmedsync(index->rd_smgr, INIT_FORKNUM);
+	smgrimmedsync(RelationGetSmgr(index), INIT_FORKNUM);
 }
 
 /*
@@ -360,6 +366,7 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
 		so->keyData = NULL;
 
 	so->arrayKeyData = NULL;	/* assume no array keys for now */
+	so->arraysStarted = false;
 	so->numArrayKeys = 0;
 	so->arrayKeys = NULL;
 	so->arrayContext = NULL;
@@ -1068,6 +1075,11 @@ backtrack:
 	opaque = NULL;
 	if (!PageIsNew(page))
 	{
+		
+		printf("%s %d, spc = %lu, db = %lu, rel = %lu\n", 
+		__FILE__, __LINE__, rel->rd_node.spcNode, rel->rd_node.dbNode, rel->rd_node.relNode); 
+		fflush(stdout);
+
 		_bt_checkpage(rel, buf);
 		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 	}
@@ -1088,8 +1100,7 @@ backtrack:
 		 * can't be half-dead because only an interrupted VACUUM process can
 		 * leave pages in that state, so we'd definitely have dealt with it
 		 * back when the page was the scanblkno page (half-dead pages are
-		 * always marked fully deleted by _bt_pagedel()).  This assumes that
-		 * there can be only one vacuum process running at a time.
+		 * always marked fully deleted by _bt_pagedel(), barring corruption).
 		 */
 		if (!opaque || !P_ISLEAF(opaque) || P_ISHALFDEAD(opaque))
 		{

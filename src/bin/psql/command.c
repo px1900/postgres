@@ -164,8 +164,7 @@ static bool get_create_object_cmd(EditableObjectType obj_type, Oid oid,
 								  PQExpBuffer buf);
 static int	strip_lineno_from_objdesc(char *obj);
 static int	count_lines_in_buf(PQExpBuffer buf);
-static void print_with_linenumbers(FILE *output, char *lines,
-								   const char *header_keyword);
+static void print_with_linenumbers(FILE *output, char *lines, bool is_func);
 static void minimal_error_message(PGresult *res);
 
 static void printSSLInfo(void);
@@ -1165,17 +1164,19 @@ exec_command_ef_ev(PsqlScanState scan_state, bool active_branch,
 				/*
 				 * lineno "1" should correspond to the first line of the
 				 * function body.  We expect that pg_get_functiondef() will
-				 * emit that on a line beginning with "AS ", and that there
-				 * can be no such line before the real start of the function
-				 * body.  Increment lineno by the number of lines before that
-				 * line, so that it becomes relative to the first line of the
-				 * function definition.
+				 * emit that on a line beginning with "AS ", "BEGIN ", or
+				 * "RETURN ", and that there can be no such line before the
+				 * real start of the function body.  Increment lineno by the
+				 * number of lines before that line, so that it becomes
+				 * relative to the first line of the function definition.
 				 */
 				const char *lines = query_buf->data;
 
 				while (*lines != '\0')
 				{
-					if (strncmp(lines, "AS ", 3) == 0)
+					if (strncmp(lines, "AS ", 3) == 0 ||
+						strncmp(lines, "BEGIN ", 6) == 0 ||
+						strncmp(lines, "RETURN ", 7) == 0)
 						break;
 					lineno++;
 					/* find start of next line */
@@ -2022,12 +2023,29 @@ exec_command_password(PsqlScanState scan_state, bool active_branch)
 
 	if (active_branch)
 	{
-		char	   *opt0 = psql_scan_slash_option(scan_state,
+		char	   *user = psql_scan_slash_option(scan_state,
 												  OT_SQLID, NULL, true);
 		char	   *pw1;
 		char	   *pw2;
+		PQExpBufferData buf;
 
-		pw1 = simple_prompt("Enter new password: ", false);
+		if (user == NULL)
+		{
+			/* By default, the command applies to CURRENT_USER */
+			PGresult   *res;
+
+			res = PSQLexec("SELECT CURRENT_USER");
+			if (!res)
+				return PSQL_CMD_ERROR;
+
+			user = pg_strdup(PQgetvalue(res, 0, 0));
+			PQclear(res);
+		}
+
+		initPQExpBuffer(&buf);
+		printfPQExpBuffer(&buf, _("Enter new password for user \"%s\": "), user);
+
+		pw1 = simple_prompt(buf.data, false);
 		pw2 = simple_prompt("Enter it again: ", false);
 
 		if (strcmp(pw1, pw2) != 0)
@@ -2037,13 +2055,7 @@ exec_command_password(PsqlScanState scan_state, bool active_branch)
 		}
 		else
 		{
-			char	   *user;
 			char	   *encrypted_password;
-
-			if (opt0)
-				user = opt0;
-			else
-				user = PQuser(pset.db);
 
 			encrypted_password = PQencryptPasswordConn(pset.db, pw1, user, NULL);
 
@@ -2054,15 +2066,12 @@ exec_command_password(PsqlScanState scan_state, bool active_branch)
 			}
 			else
 			{
-				PQExpBufferData buf;
 				PGresult   *res;
 
-				initPQExpBuffer(&buf);
 				printfPQExpBuffer(&buf, "ALTER USER %s PASSWORD ",
 								  fmtId(user));
 				appendStringLiteralConn(&buf, encrypted_password, pset.db);
 				res = PSQLexec(buf.data);
-				termPQExpBuffer(&buf);
 				if (!res)
 					success = false;
 				else
@@ -2071,10 +2080,10 @@ exec_command_password(PsqlScanState scan_state, bool active_branch)
 			}
 		}
 
-		if (opt0)
-			free(opt0);
+		free(user);
 		free(pw1);
 		free(pw2);
+		termPQExpBuffer(&buf);
 	}
 	else
 		ignore_slash_options(scan_state);
@@ -2444,15 +2453,8 @@ exec_command_sf_sv(PsqlScanState scan_state, bool active_branch,
 
 			if (show_linenumbers)
 			{
-				/*
-				 * For functions, lineno "1" should correspond to the first
-				 * line of the function body.  We expect that
-				 * pg_get_functiondef() will emit that on a line beginning
-				 * with "AS ", and that there can be no such line before the
-				 * real start of the function body.
-				 */
-				print_with_linenumbers(output, buf->data,
-									   is_func ? "AS " : NULL);
+				/* add line numbers */
+				print_with_linenumbers(output, buf->data, is_func);
 			}
 			else
 			{
@@ -4984,6 +4986,14 @@ do_watch(PQExpBuffer query_buf, double sleep)
 		sigint_interrupt_enabled = false;
 	}
 
+	/*
+	 * If the terminal driver echoed "^C", libedit/libreadline might be
+	 * confused about the cursor position.  Therefore, inject a newline
+	 * before the next prompt is displayed.
+	 */
+	fprintf(stdout, "\n");
+	fflush(stdout);
+
 	pg_free(title);
 	return (res >= 0);
 }
@@ -5337,24 +5347,28 @@ count_lines_in_buf(PQExpBuffer buf)
 /*
  * Write text at *lines to output with line numbers.
  *
- * If header_keyword isn't NULL, then line 1 should be the first line beginning
- * with header_keyword; lines before that are unnumbered.
+ * For functions, lineno "1" should correspond to the first line of the
+ * function body; lines before that are unnumbered.  We expect that
+ * pg_get_functiondef() will emit that on a line beginning with "AS ",
+ * "BEGIN ", or "RETURN ", and that there can be no such line before
+ * the real start of the function body.
  *
  * Caution: this scribbles on *lines.
  */
 static void
-print_with_linenumbers(FILE *output, char *lines,
-					   const char *header_keyword)
+print_with_linenumbers(FILE *output, char *lines, bool is_func)
 {
-	bool		in_header = (header_keyword != NULL);
-	size_t		header_sz = in_header ? strlen(header_keyword) : 0;
+	bool		in_header = is_func;
 	int			lineno = 0;
 
 	while (*lines != '\0')
 	{
 		char	   *eol;
 
-		if (in_header && strncmp(lines, header_keyword, header_sz) == 0)
+		if (in_header &&
+			(strncmp(lines, "AS ", 3) == 0 ||
+			 strncmp(lines, "BEGIN ", 6) == 0 ||
+			 strncmp(lines, "RETURN ", 7) == 0))
 			in_header = false;
 
 		/* increment lineno only for body's lines */

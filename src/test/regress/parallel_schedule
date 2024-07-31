@@ -51,7 +51,7 @@ test: copy copyselect copydml insert insert_conflict
 # ----------
 # More groups of parallel tests
 # ----------
-test: create_misc create_operator create_procedure
+test: create_misc create_operator create_procedure create_schema
 # These depend on create_misc and create_operator
 test: create_index create_index_spgist create_view index_including index_including_gist
 
@@ -96,6 +96,7 @@ test: rules psql psql_crosstab amutils stats_ext collate.linux.utf8
 # run by itself so it can run parallel workers
 test: select_parallel
 test: write_parallel
+test: vacuum_parallel
 
 # no relation related tests can be put in this group
 test: publication subscription

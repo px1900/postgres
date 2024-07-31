@@ -211,7 +211,9 @@ transformTargetList(ParseState *pstate, List *targetlist,
  * This is the identical transformation to transformTargetList, except that
  * the input list elements are bare expressions without ResTarget decoration,
  * and the output elements are likewise just expressions without TargetEntry
- * decoration.  We use this for ROW() and VALUES() constructs.
+ * decoration.  Also, we don't expect any multiassign constructs within the
+ * list, so there's nothing to do for that.  We use this for ROW() and
+ * VALUES() constructs.
  *
  * exprKind is not enough to tell us whether to allow SetToDefault, so
  * an additional flag is needed for that.
@@ -272,9 +274,6 @@ transformExpressionList(ParseState *pstate, List *exprlist,
 
 		result = lappend(result, e);
 	}
-
-	/* Shouldn't have any multiassign items here */
-	Assert(pstate->p_multiassign_exprs == NIL);
 
 	return result;
 }
@@ -1504,7 +1503,8 @@ ExpandRowReference(ParseState *pstate, Node *expr,
  * drill down to find the ultimate defining expression and attempt to infer
  * the tupdesc from it.  We ereport if we can't determine the tupdesc.
  *
- * levelsup is an extra offset to interpret the Var's varlevelsup correctly.
+ * levelsup is an extra offset to interpret the Var's varlevelsup correctly
+ * when recursing.  Outside callers should pass zero.
  */
 TupleDesc
 expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
@@ -1592,11 +1592,17 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 					/*
 					 * Recurse into the sub-select to see what its Var refers
 					 * to.  We have to build an additional level of ParseState
-					 * to keep in step with varlevelsup in the subselect.
+					 * to keep in step with varlevelsup in the subselect;
+					 * furthermore, the subquery RTE might be from an outer
+					 * query level, in which case the ParseState for the
+					 * subselect must have that outer level as parent.
 					 */
-					ParseState	mypstate;
+					ParseState	mypstate = {0};
+					Index		levelsup;
 
-					MemSet(&mypstate, 0, sizeof(mypstate));
+					/* this loop must work, since GetRTEByRangeTablePosn did */
+					for (levelsup = 0; levelsup < netlevelsup; levelsup++)
+						pstate = pstate->parentParseState;
 					mypstate.parentParseState = pstate;
 					mypstate.p_rtable = rte->subquery->rtable;
 					/* don't bother filling the rest of the fake pstate */
@@ -1647,12 +1653,11 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 					 * Recurse into the CTE to see what its Var refers to. We
 					 * have to build an additional level of ParseState to keep
 					 * in step with varlevelsup in the CTE; furthermore it
-					 * could be an outer CTE.
+					 * could be an outer CTE (compare SUBQUERY case above).
 					 */
-					ParseState	mypstate;
+					ParseState	mypstate = {0};
 					Index		levelsup;
 
-					MemSet(&mypstate, 0, sizeof(mypstate));
 					/* this loop must work, since GetCTEForRTE did */
 					for (levelsup = 0;
 						 levelsup < rte->ctelevelsup + netlevelsup;

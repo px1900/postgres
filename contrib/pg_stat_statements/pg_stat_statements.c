@@ -385,7 +385,7 @@ _PG_init(void)
 							&pgss_max,
 							5000,
 							100,
-							INT_MAX,
+							INT_MAX / 2,
 							PGC_POSTMASTER,
 							0,
 							NULL,
@@ -1077,6 +1077,8 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 {
 	Node	   *parsetree = pstmt->utilityStmt;
 	uint64		saved_queryId = pstmt->queryId;
+	int			saved_stmt_location = pstmt->stmt_location;
+	int			saved_stmt_len = pstmt->stmt_len;
 
 	/*
 	 * Force utility statements to get queryId zero.  We do this even in cases
@@ -1142,6 +1144,16 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 		}
 		PG_END_TRY();
 
+		/*
+		 * CAUTION: do not access the *pstmt data structure again below here.
+		 * If it was a ROLLBACK or similar, that data structure may have been
+		 * freed.  We must copy everything we still need into local variables,
+		 * which we did above.
+		 *
+		 * For the same reason, we can't risk restoring pstmt->queryId to its
+		 * former value, which'd otherwise be a good idea.
+		 */
+
 		INSTR_TIME_SET_CURRENT(duration);
 		INSTR_TIME_SUBTRACT(duration, start);
 
@@ -1166,8 +1178,8 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 
 		pgss_store(queryString,
 				   saved_queryId,
-				   pstmt->stmt_location,
-				   pstmt->stmt_len,
+				   saved_stmt_location,
+				   saved_stmt_len,
 				   PGSS_EXEC,
 				   INSTR_TIME_GET_MILLISEC(duration),
 				   rows,
@@ -1190,10 +1202,6 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 
 /*
  * Store some statistics for a statement.
- *
- * If queryId is 0 then this is a utility statement for which we couldn't
- * compute a queryId during parse analysis, and we should compute a suitable
- * queryId internally.
  *
  * If jstate is not NULL then we're trying to create an entry for which
  * we have no statistics as yet; we just want to record the normalized
@@ -1239,7 +1247,7 @@ pgss_store(const char *query, uint64 queryId,
 
 	/* Set up key for hashtable search */
 
-	/* memset() is required when pgssHashKey is without padding only */
+	/* clear padding */
 	memset(&key, 0, sizeof(pgssHashKey));
 
 	key.userid = GetUserId();
@@ -2064,6 +2072,18 @@ qtext_store(const char *query, int query_len,
 
 	*query_offset = off;
 
+	/*
+	 * Don't allow the file to grow larger than what qtext_load_file can
+	 * (theoretically) handle.  This has been seen to be reachable on 32-bit
+	 * platforms.
+	 */
+	if (unlikely(query_len >= MaxAllocHugeSize - off))
+	{
+		errno = EFBIG;			/* not quite right, but it'll do */
+		fd = -1;
+		goto error;
+	}
+
 	/* Now write the data into the successfully-reserved part of the file */
 	fd = OpenTransientFile(PGSS_TEXT_FILE, O_RDWR | O_CREAT | PG_BINARY);
 	if (fd < 0)
@@ -2125,6 +2145,7 @@ qtext_load_file(Size *buffer_size)
 	char	   *buf;
 	int			fd;
 	struct stat stat;
+	Size		nread;
 
 	fd = OpenTransientFile(PGSS_TEXT_FILE, O_RDONLY | PG_BINARY);
 	if (fd < 0)
@@ -2165,23 +2186,35 @@ qtext_load_file(Size *buffer_size)
 	}
 
 	/*
-	 * OK, slurp in the file.  If we get a short read and errno doesn't get
-	 * set, the reason is probably that garbage collection truncated the file
-	 * since we did the fstat(), so we don't log a complaint --- but we don't
-	 * return the data, either, since it's most likely corrupt due to
-	 * concurrent writes from garbage collection.
+	 * OK, slurp in the file.  Windows fails if we try to read more than
+	 * INT_MAX bytes at once, and other platforms might not like that either,
+	 * so read a very large file in 1GB segments.
 	 */
-	errno = 0;
-	if (read(fd, buf, stat.st_size) != stat.st_size)
+	nread = 0;
+	while (nread < stat.st_size)
 	{
-		if (errno)
-			ereport(LOG,
-					(errcode_for_file_access(),
-					 errmsg("could not read file \"%s\": %m",
-							PGSS_TEXT_FILE)));
-		free(buf);
-		CloseTransientFile(fd);
-		return NULL;
+		int			toread = Min(1024 * 1024 * 1024, stat.st_size - nread);
+
+		/*
+		 * If we get a short read and errno doesn't get set, the reason is
+		 * probably that garbage collection truncated the file since we did
+		 * the fstat(), so we don't log a complaint --- but we don't return
+		 * the data, either, since it's most likely corrupt due to concurrent
+		 * writes from garbage collection.
+		 */
+		errno = 0;
+		if (read(fd, buf + nread, toread) != toread)
+		{
+			if (errno)
+				ereport(LOG,
+						(errcode_for_file_access(),
+						 errmsg("could not read file \"%s\": %m",
+								PGSS_TEXT_FILE)));
+			free(buf);
+			CloseTransientFile(fd);
+			return NULL;
+		}
+		nread += toread;
 	}
 
 	if (CloseTransientFile(fd) != 0)
@@ -2189,7 +2222,7 @@ qtext_load_file(Size *buffer_size)
 				(errcode_for_file_access(),
 				 errmsg("could not close file \"%s\": %m", PGSS_TEXT_FILE)));
 
-	*buffer_size = stat.st_size;
+	*buffer_size = nread;
 	return buf;
 }
 
@@ -2236,8 +2269,14 @@ need_gc_qtexts(void)
 		SpinLockRelease(&s->mutex);
 	}
 
-	/* Don't proceed if file does not exceed 512 bytes per possible entry */
-	if (extent < 512 * pgss_max)
+	/*
+	 * Don't proceed if file does not exceed 512 bytes per possible entry.
+	 *
+	 * Here and in the next test, 32-bit machines have overflow hazards if
+	 * pgss_max and/or mean_query_len are large.  Force the multiplications
+	 * and comparisons to be done in uint64 arithmetic to forestall trouble.
+	 */
+	if ((uint64) extent < (uint64) 512 * pgss_max)
 		return false;
 
 	/*
@@ -2247,7 +2286,7 @@ need_gc_qtexts(void)
 	 * query length in order to prevent garbage collection from thrashing
 	 * uselessly.
 	 */
-	if (extent < pgss->mean_query_len * pgss_max * 2)
+	if ((uint64) extent < (uint64) pgss->mean_query_len * pgss_max * 2)
 		return false;
 
 	return true;
@@ -2479,16 +2518,16 @@ entry_reset(Oid userid, Oid dbid, uint64 queryid)
 		key.dbid = dbid;
 		key.queryid = queryid;
 
-		/* Remove the key if it exists, starting with the top-level entry  */
+		/*
+		 * Remove the key if it exists, starting with the non-top-level entry.
+		 */
 		key.toplevel = false;
 		entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_REMOVE, NULL);
 		if (entry)				/* found */
 			num_remove++;
 
-		/* Also remove entries for top level statements */
+		/* Also remove the top-level entry if it exists. */
 		key.toplevel = true;
-
-		/* Remove the key if exists */
 		entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_REMOVE, NULL);
 		if (entry)				/* found */
 			num_remove++;

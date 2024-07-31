@@ -313,6 +313,7 @@ mdcreate(SMgrRelation reln, ForkNumber forkNum, bool isRedo)
     PartitionUnlock(MdPartitionMutex, (void*)&forkTagData);
 //    printf("%s ends, pid=%d, tid=%d\n", __func__ , getpid(), gettid());
 //    fflush(stdout);
+
 }
 
 /*

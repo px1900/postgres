@@ -1326,7 +1326,7 @@ dropDBs(PGconn *conn)
 	res = executeQuery(conn,
 					   "SELECT datname "
 					   "FROM pg_database d "
-					   "WHERE datallowconn "
+					   "WHERE datallowconn AND datconnlimit != -2 "
 					   "ORDER BY datname");
 
 	if (PQntuples(res) > 0)
@@ -1438,10 +1438,21 @@ expand_dbname_patterns(PGconn *conn,
 
 	for (SimpleStringListCell *cell = patterns->head; cell; cell = cell->next)
 	{
+		int		dotcnt;
+
 		appendPQExpBufferStr(query,
 							 "SELECT datname FROM pg_catalog.pg_database n\n");
 		processSQLNamePattern(conn, query, cell->val, false,
-							  false, NULL, "datname", NULL, NULL);
+							  false, NULL, "datname", NULL, NULL, NULL,
+							  &dotcnt);
+
+		if (dotcnt > 0)
+		{
+			pg_log_error("improper qualified name (too many dotted names): %s",
+						 cell->val);
+			PQfinish(conn);
+			exit_nicely(1);
+		}
 
 		res = executeQuery(conn, query->data);
 		for (int i = 0; i < PQntuples(res); i++)
@@ -1479,7 +1490,7 @@ dumpDatabases(PGconn *conn)
 	res = executeQuery(conn,
 					   "SELECT datname "
 					   "FROM pg_database d "
-					   "WHERE datallowconn "
+					   "WHERE datallowconn AND datconnlimit != -2 "
 					   "ORDER BY (datname <> 'template1'), datname");
 
 	if (PQntuples(res) > 0)

@@ -25,6 +25,7 @@
 #include "catalog/pg_amop.h"
 #include "commands/vacuum.h"
 #include "nodes/nodeFuncs.h"
+#include "parser/parse_coerce.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
 #include "storage/lmgr.h"
@@ -184,8 +185,6 @@ spgGetCache(Relation index)
 		Oid			atttype;
 		spgConfigIn in;
 		FmgrInfo   *procinfo;
-		Buffer		metabuffer;
-		SpGistMetaPageData *metadata;
 
 		cache = MemoryContextAllocZero(index->rd_indexcxt,
 									   sizeof(SpGistCache));
@@ -218,8 +217,19 @@ spgGetCache(Relation index)
 		 * correctly, so believe leafType if it's given.)
 		 */
 		if (!OidIsValid(cache->config.leafType))
+		{
 			cache->config.leafType =
 				TupleDescAttr(RelationGetDescr(index), spgKeyColumn)->atttypid;
+
+			/*
+			 * If index column type is binary-coercible to atttype (for
+			 * example, it's a domain over atttype), treat it as plain atttype
+			 * to avoid thinking we need to compress.
+			 */
+			if (cache->config.leafType != atttype &&
+				IsBinaryCoercible(cache->config.leafType, atttype))
+				cache->config.leafType = atttype;
+		}
 
 		/* Get the information we need about each relevant datatype */
 		fillTypeDesc(&cache->attType, atttype);
@@ -242,19 +252,28 @@ spgGetCache(Relation index)
 		fillTypeDesc(&cache->attPrefixType, cache->config.prefixType);
 		fillTypeDesc(&cache->attLabelType, cache->config.labelType);
 
-		/* Last, get the lastUsedPages data from the metapage */
-		metabuffer = ReadBuffer(index, SPGIST_METAPAGE_BLKNO);
-		LockBuffer(metabuffer, BUFFER_LOCK_SHARE);
+		/*
+		 * Finally, if it's a real index (not a partitioned one), get the
+		 * lastUsedPages data from the metapage
+		 */
+		if (index->rd_rel->relkind != RELKIND_PARTITIONED_INDEX)
+		{
+			Buffer		metabuffer;
+			SpGistMetaPageData *metadata;
 
-		metadata = SpGistPageGetMeta(BufferGetPage(metabuffer));
+			metabuffer = ReadBuffer(index, SPGIST_METAPAGE_BLKNO);
+			LockBuffer(metabuffer, BUFFER_LOCK_SHARE);
 
-		if (metadata->magicNumber != SPGIST_MAGIC_NUMBER)
-			elog(ERROR, "index \"%s\" is not an SP-GiST index",
-				 RelationGetRelationName(index));
+			metadata = SpGistPageGetMeta(BufferGetPage(metabuffer));
 
-		cache->lastUsedPages = metadata->lastUsedPages;
+			if (metadata->magicNumber != SPGIST_MAGIC_NUMBER)
+				elog(ERROR, "index \"%s\" is not an SP-GiST index",
+					 RelationGetRelationName(index));
 
-		UnlockReleaseBuffer(metabuffer);
+			cache->lastUsedPages = metadata->lastUsedPages;
+
+			UnlockReleaseBuffer(metabuffer);
+		}
 
 		index->rd_amcache = (void *) cache;
 	}
@@ -1290,7 +1309,7 @@ spgproperty(Oid index_oid, int attno,
 	/*
 	 * Currently, SP-GiST distance-ordered scans require that there be a
 	 * distance operator in the opclass with the default types. So we assume
-	 * that if such a operator exists, then there's a reason for it.
+	 * that if such an operator exists, then there's a reason for it.
 	 */
 
 	/* First we need to know the column's opclass. */

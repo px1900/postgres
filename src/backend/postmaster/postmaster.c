@@ -1041,7 +1041,7 @@ PostmasterMain(int argc, char *argv[])
 	/*
 	 * Set reference point for stack-depth checking.
 	 */
-	set_stack_base();
+	(void) set_stack_base();
 
 	/*
 	 * Initialize pipe (or process handle on Windows) that allows children to
@@ -1105,6 +1105,17 @@ PostmasterMain(int argc, char *argv[])
 						LOG_METAINFO_DATAFILE)));
 
 	/*
+	 * Initialize input sockets.
+	 *
+	 * Mark them all closed, and set up an on_proc_exit function that's
+	 * charged with closing the sockets again at postmaster shutdown.
+	 */
+	for (i = 0; i < MAXLISTEN; i++)
+		ListenSocket[i] = PGINVALID_SOCKET;
+
+	on_proc_exit(CloseServerPorts, 0);
+
+	/*
 	 * If enabled, start up syslogger collection subprocess
 	 */
 	SysLoggerPID = SysLogger_Start();
@@ -1138,15 +1149,7 @@ PostmasterMain(int argc, char *argv[])
 
 	/*
 	 * Establish input sockets.
-	 *
-	 * First, mark them all closed, and set up an on_proc_exit function that's
-	 * charged with closing the sockets again at postmaster shutdown.
 	 */
-	for (i = 0; i < MAXLISTEN; i++)
-		ListenSocket[i] = PGINVALID_SOCKET;
-
-	on_proc_exit(CloseServerPorts, 0);
-
 	if (ListenAddresses)
 	{
 		char	   *rawstring;
@@ -2027,6 +2030,13 @@ ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done)
 
 	if (proto == CANCEL_REQUEST_CODE)
 	{
+		if (len != sizeof(CancelRequestPacket))
+		{
+			ereport(COMMERROR,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("invalid length of startup packet")));
+			return STATUS_ERROR;
+		}
 		processCancelRequest(port, buf);
 		/* Not really an error, but we don't want to proceed further */
 		return STATUS_ERROR;
@@ -2063,6 +2073,18 @@ retry1:
 #endif
 
 		/*
+		 * At this point we should have no data already buffered.  If we do,
+		 * it was received before we performed the SSL handshake, so it wasn't
+		 * encrypted and indeed may have been injected by a man-in-the-middle.
+		 * We report this case to the client.
+		 */
+		if (pq_buffer_has_data())
+			ereport(FATAL,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("received unencrypted data after SSL request"),
+					 errdetail("This could be either a client-software bug or evidence of an attempted man-in-the-middle attack.")));
+
+		/*
 		 * regular startup packet, cancel, etc packet should follow, but not
 		 * another SSL negotiation request, and a GSS request should only
 		 * follow if SSL was rejected (client may negotiate in either order)
@@ -2093,6 +2115,18 @@ retry1:
 		if (GSSok == 'G' && secure_open_gssapi(port) == -1)
 			return STATUS_ERROR;
 #endif
+
+		/*
+		 * At this point we should have no data already buffered.  If we do,
+		 * it was received before we performed the GSS handshake, so it wasn't
+		 * encrypted and indeed may have been injected by a man-in-the-middle.
+		 * We report this case to the client.
+		 */
+		if (pq_buffer_has_data())
+			ereport(FATAL,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("received unencrypted data after GSSAPI encryption request"),
+					 errdetail("This could be either a client-software bug or evidence of an attempted man-in-the-middle attack.")));
 
 		/*
 		 * regular startup packet, cancel, etc packet should follow, but not
@@ -4839,18 +4873,10 @@ retry:
 
 	/*
 	 * Queue a waiter to signal when this child dies. The wait will be handled
-	 * automatically by an operating system thread pool.
-	 *
-	 * Note: use malloc instead of palloc, since it needs to be thread-safe.
-	 * Struct will be free():d from the callback function that runs on a
-	 * different thread.
+	 * automatically by an operating system thread pool.  The memory will be
+	 * freed by a later call to waitpid().
 	 */
-	childinfo = malloc(sizeof(win32_deadchild_waitinfo));
-	if (!childinfo)
-		ereport(FATAL,
-				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("out of memory")));
-
+	childinfo = palloc(sizeof(win32_deadchild_waitinfo));
 	childinfo->procHandle = pi.hProcess;
 	childinfo->procId = pi.dwProcessId;
 
@@ -4864,7 +4890,7 @@ retry:
 				(errmsg_internal("could not register process for wait: error code %lu",
 								 GetLastError())));
 
-	/* Don't close pi.hProcess here - the wait thread needs access to it */
+	/* Don't close pi.hProcess here - waitpid() needs access to it */
 
 	CloseHandle(pi.hThread);
 
@@ -4928,7 +4954,7 @@ SubPostmasterMain(int argc, char *argv[])
 	 * If testing EXEC_BACKEND on Linux, you should run this as root before
 	 * starting the postmaster:
 	 *
-	 * echo 0 >/proc/sys/kernel/randomize_va_space
+	 * sysctl -w kernel.randomize_va_space=0
 	 *
 	 * This prevents using randomized stack and code addresses that cause the
 	 * child process's memory map to be different from the parent's, making it
@@ -6508,36 +6534,21 @@ ShmemBackendArrayRemove(Backend *bn)
 static pid_t
 waitpid(pid_t pid, int *exitstatus, int options)
 {
+	win32_deadchild_waitinfo *childinfo;
+	DWORD		exitcode;
 	DWORD		dwd;
 	ULONG_PTR	key;
 	OVERLAPPED *ovl;
 
-	/*
-	 * Check if there are any dead children. If there are, return the pid of
-	 * the first one that died.
-	 */
-	if (GetQueuedCompletionStatus(win32ChildQueue, &dwd, &key, &ovl, 0))
+	/* Try to consume one win32_deadchild_waitinfo from the queue. */
+	if (!GetQueuedCompletionStatus(win32ChildQueue, &dwd, &key, &ovl, 0))
 	{
-		*exitstatus = (int) key;
-		return dwd;
+		errno = EAGAIN;
+		return -1;
 	}
 
-	return -1;
-}
-
-/*
- * Note! Code below executes on a thread pool! All operations must
- * be thread safe! Note that elog() and friends must *not* be used.
- */
-static void WINAPI
-pgwin32_deadchild_callback(PVOID lpParameter, BOOLEAN TimerOrWaitFired)
-{
-	win32_deadchild_waitinfo *childinfo = (win32_deadchild_waitinfo *) lpParameter;
-	DWORD		exitcode;
-
-	if (TimerOrWaitFired)
-		return;					/* timeout. Should never happen, since we use
-								 * INFINITE as timeout value. */
+	childinfo = (win32_deadchild_waitinfo *) key;
+	pid = childinfo->procId;
 
 	/*
 	 * Remove handle from wait - required even though it's set to wait only
@@ -6553,13 +6564,11 @@ pgwin32_deadchild_callback(PVOID lpParameter, BOOLEAN TimerOrWaitFired)
 		write_stderr("could not read exit code for process\n");
 		exitcode = 255;
 	}
-
-	if (!PostQueuedCompletionStatus(win32ChildQueue, childinfo->procId, (ULONG_PTR) exitcode, NULL))
-		write_stderr("could not post child completion status\n");
+	*exitstatus = exitcode;
 
 	/*
-	 * Handle is per-process, so we close it here instead of in the
-	 * originating thread
+	 * Close the process handle.  Only after this point can the PID can be
+	 * recycled by the kernel.
 	 */
 	CloseHandle(childinfo->procHandle);
 
@@ -6567,9 +6576,36 @@ pgwin32_deadchild_callback(PVOID lpParameter, BOOLEAN TimerOrWaitFired)
 	 * Free struct that was allocated before the call to
 	 * RegisterWaitForSingleObject()
 	 */
-	free(childinfo);
+	pfree(childinfo);
 
-	/* Queue SIGCHLD signal */
+	return pid;
+}
+
+/*
+ * Note! Code below executes on a thread pool! All operations must
+ * be thread safe! Note that elog() and friends must *not* be used.
+ */
+static void WINAPI
+pgwin32_deadchild_callback(PVOID lpParameter, BOOLEAN TimerOrWaitFired)
+{
+	/* Should never happen, since we use INFINITE as timeout value. */
+	if (TimerOrWaitFired)
+		return;
+
+	/*
+	 * Post the win32_deadchild_waitinfo object for waitpid() to deal with. If
+	 * that fails, we leak the object, but we also leak a whole process and
+	 * get into an unrecoverable state, so there's not much point in worrying
+	 * about that.  We'd like to panic, but we can't use that infrastructure
+	 * from this thread.
+	 */
+	if (!PostQueuedCompletionStatus(win32ChildQueue,
+									0,
+									(ULONG_PTR) lpParameter,
+									NULL))
+		write_stderr("could not post child completion status\n");
+
+	/* Queue SIGCHLD signal. */
 	pg_queue_signal(SIGCHLD);
 }
 #endif							/* WIN32 */

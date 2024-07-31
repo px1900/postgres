@@ -317,6 +317,8 @@ SELECT ARRAY[[1,2],[3,4]] || ARRAY[5,6] AS "{{1,2},{3,4},{5,6}}";
 SELECT ARRAY[0,0] || ARRAY[1,1] || ARRAY[2,2] AS "{0,0,1,1,2,2}";
 SELECT 0 || ARRAY[1,2] || 3 AS "{0,1,2,3}";
 SELECT ARRAY[1.1] || ARRAY[2,3,4];
+SELECT array_agg(x) || array_agg(x) FROM (VALUES (ROW(1,2)), (ROW(3,4))) v(x);
+SELECT ROW(1,2) || array_agg(x) FROM (VALUES (ROW(3,4)), (ROW(5,6))) v(x);
 
 SELECT * FROM array_op_test WHERE i @> '{32}' ORDER BY seqno;
 SELECT * FROM array_op_test WHERE i && '{32}' ORDER BY seqno;
@@ -412,6 +414,25 @@ insert into arr_pk_tbl(pk, f1[1:2]) values (1, '{6,7,8}') on conflict (pk)
 -- then you didn't get an indexscan plan, and something is busted.
 reset enable_seqscan;
 reset enable_bitmapscan;
+
+-- test subscript overflow detection
+
+-- The normal error message includes a platform-dependent limit,
+-- so suppress it to avoid needing multiple expected-files.
+\set VERBOSITY sqlstate
+
+insert into arr_pk_tbl values(10, '[-2147483648:-2147483647]={1,2}');
+update arr_pk_tbl set f1[2147483647] = 42 where pk = 10;
+update arr_pk_tbl set f1[2147483646:2147483647] = array[4,2] where pk = 10;
+
+-- also exercise the expanded-array case
+do $$ declare a int[];
+begin
+  a := '[-2147483648:-2147483647]={1,2}'::int[];
+  a[2147483647] := 42;
+end $$;
+
+\set VERBOSITY default
 
 -- test [not] (like|ilike) (any|all) (...)
 select 'foo' like any (array['%a', '%o']); -- t
@@ -735,3 +756,4 @@ FROM
 
 SELECT trim_array(ARRAY[1, 2, 3], -1); -- fail
 SELECT trim_array(ARRAY[1, 2, 3], 10); -- fail
+SELECT trim_array(ARRAY[]::int[], 1); -- fail

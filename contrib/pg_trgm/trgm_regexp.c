@@ -905,6 +905,7 @@ transformGraph(TrgmNFA *trgmNFA)
 	HASHCTL		hashCtl;
 	TrgmStateKey initkey;
 	TrgmState  *initstate;
+	ListCell   *lc;
 
 	/* Initialize this stage's workspace in trgmNFA struct */
 	trgmNFA->queue = NIL;
@@ -935,12 +936,13 @@ transformGraph(TrgmNFA *trgmNFA)
 	/*
 	 * Recursively build the expanded graph by processing queue of states
 	 * (breadth-first search).  getState already put initstate in the queue.
+	 * Note that getState will append new states to the queue within the loop,
+	 * too; this works as long as we don't do repeat fetches using the "lc"
+	 * pointer.
 	 */
-	while (trgmNFA->queue != NIL)
+	foreach(lc, trgmNFA->queue)
 	{
-		TrgmState  *state = (TrgmState *) linitial(trgmNFA->queue);
-
-		trgmNFA->queue = list_delete_first(trgmNFA->queue);
+		TrgmState  *state = (TrgmState *) lfirst(lc);
 
 		/*
 		 * If we overflowed then just mark state as final.  Otherwise do
@@ -964,21 +966,28 @@ transformGraph(TrgmNFA *trgmNFA)
 static void
 processState(TrgmNFA *trgmNFA, TrgmState *state)
 {
+	ListCell   *lc;
+
 	/* keysQueue should be NIL already, but make sure */
 	trgmNFA->keysQueue = NIL;
 
 	/*
 	 * Add state's own key, and then process all keys added to keysQueue until
-	 * queue is empty.  But we can quit if the state gets marked final.
+	 * queue is finished.  But we can quit if the state gets marked final.
 	 */
 	addKey(trgmNFA, state, &state->stateKey);
-	while (trgmNFA->keysQueue != NIL && !(state->flags & TSTATE_FIN))
+	foreach(lc, trgmNFA->keysQueue)
 	{
-		TrgmStateKey *key = (TrgmStateKey *) linitial(trgmNFA->keysQueue);
+		TrgmStateKey *key = (TrgmStateKey *) lfirst(lc);
 
-		trgmNFA->keysQueue = list_delete_first(trgmNFA->keysQueue);
+		if (state->flags & TSTATE_FIN)
+			break;
 		addKey(trgmNFA, state, key);
 	}
+
+	/* Release keysQueue to clean up for next cycle */
+	list_free(trgmNFA->keysQueue);
+	trgmNFA->keysQueue = NIL;
 
 	/*
 	 * Add outgoing arcs only if state isn't final (we have no interest in
@@ -1935,9 +1944,7 @@ packGraph(TrgmNFA *trgmNFA, MemoryContext rcontext)
 				arcsCount;
 	HASH_SEQ_STATUS scan_status;
 	TrgmState  *state;
-	TrgmPackArcInfo *arcs,
-			   *p1,
-			   *p2;
+	TrgmPackArcInfo *arcs;
 	TrgmPackedArc *packedArcs;
 	TrgmPackedGraph *result;
 	int			i,
@@ -2009,17 +2016,25 @@ packGraph(TrgmNFA *trgmNFA, MemoryContext rcontext)
 	qsort(arcs, arcIndex, sizeof(TrgmPackArcInfo), packArcInfoCmp);
 
 	/* We could have duplicates because states were merged. Remove them. */
-	/* p1 is probe point, p2 is last known non-duplicate. */
-	p2 = arcs;
-	for (p1 = arcs + 1; p1 < arcs + arcIndex; p1++)
+	if (arcIndex > 1)
 	{
-		if (packArcInfoCmp(p1, p2) > 0)
+		/* p1 is probe point, p2 is last known non-duplicate. */
+		TrgmPackArcInfo *p1,
+				   *p2;
+
+		p2 = arcs;
+		for (p1 = arcs + 1; p1 < arcs + arcIndex; p1++)
 		{
-			p2++;
-			*p2 = *p1;
+			if (packArcInfoCmp(p1, p2) > 0)
+			{
+				p2++;
+				*p2 = *p1;
+			}
 		}
+		arcsCount = (p2 - arcs) + 1;
 	}
-	arcsCount = (p2 - arcs) + 1;
+	else
+		arcsCount = arcIndex;
 
 	/* Create packed representation */
 	result = (TrgmPackedGraph *)

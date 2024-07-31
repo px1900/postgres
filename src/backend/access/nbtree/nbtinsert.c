@@ -28,6 +28,8 @@
 /* Minimum tree height for application of fastpath optimization */
 #define BTREE_FASTPATH_MIN_LEVEL	2
 
+#
+
 
 static BTStack _bt_search_insert(Relation rel, BTInsertState insertstate);
 static TransactionId _bt_check_unique(Relation rel, BTInsertState insertstate,
@@ -72,6 +74,11 @@ static BlockNumber *_bt_deadblocks(Page page, OffsetNumber *deletable,
 								   int *nblocks);
 static inline int _bt_blk_cmp(const void *arg1, const void *arg2);
 
+
+Buffer
+_bt_getbuf_rename(Relation rel, BlockNumber blkno, int access);
+// _bt_getbuf will call _bt_getbuf_rename2() and printf($location)
+#define _bt_getbuf(rel, blkno, access) _bt_getbuf_rename2(rel, blkno, access, __func__, __LINE__)
 /*
  *	_bt_doinsert() -- Handle insertion of a single index tuple in the tree.
  *
@@ -325,6 +332,10 @@ _bt_search_insert(Relation rel, BTInsertState insertstate)
 		{
 			Page		page;
 			BTPageOpaque opaque;
+
+			printf("%s %d, spc = %lu, db = %lu, rel = %lu\n", 
+			__FILE__, __LINE__, rel->rd_node.spcNode, rel->rd_node.dbNode, rel->rd_node.relNode); 
+			fflush(stdout);
 
 			_bt_checkpage(rel, insertstate->buf);
 			page = BufferGetPage(insertstate->buf);
@@ -1164,9 +1175,28 @@ _bt_insertonpg(Relation rel,
 		 * its post-split version is treated as an extra step in either the
 		 * insert or page split critical section.
 		 */
-		Assert(isleaf && !ItemIdIsDead(itemid));
-		Assert(itup_key->heapkeyspace && itup_key->allequalimage);
+		Assert(isleaf && itup_key->heapkeyspace && itup_key->allequalimage);
 		oposting = (IndexTuple) PageGetItem(page, itemid);
+
+		/*
+		 * postingoff value comes from earlier call to _bt_binsrch_posting().
+		 * Its binary search might think that a plain tuple must be a posting
+		 * list tuple that needs to be split.  This can happen with corruption
+		 * involving an existing plain tuple that is a duplicate of the new
+		 * item, up to and including its table TID.  Check for that here in
+		 * passing.
+		 *
+		 * Also verify that our caller has made sure that the existing posting
+		 * list tuple does not have its LP_DEAD bit set.
+		 */
+		if (!BTreeTupleIsPosting(oposting) || ItemIdIsDead(itemid))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg_internal("table tid from new index tuple (%u,%u) overlaps with invalid duplicate tuple at offset %u of block %u in index \"%s\"",
+									 ItemPointerGetBlockNumber(&itup->t_tid),
+									 ItemPointerGetOffsetNumber(&itup->t_tid),
+									 newitemoff, BufferGetBlockNumber(buf),
+									 RelationGetRelationName(rel))));
 
 		/* use a mutable copy of itup as our itup from here on */
 		origitup = itup;

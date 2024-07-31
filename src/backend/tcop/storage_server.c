@@ -1722,7 +1722,7 @@ RpcServerMain(int argc, char *argv[],
     HashMapInit(&pageVersionHashMap, 1023);
     RelSizePthreadLockInit();
 
-    for(int i = 0; i < 5; i++) {
+    for(int i = 0; i < 0; i++) {
         printf("%s start background replayer %d\n", __func__ , i);
         pthread_t tempTid;
         pthread_create(&tempTid, NULL, (void*) BackgroundHashMapCleanPageVersion, NULL);
@@ -1795,6 +1795,9 @@ RpcServerMain(int argc, char *argv[],
     InitAuxiliaryProcess();
 
 //    StartupPid = StartChildProcess(StartupProcess);
+
+	printf("%s %d start\n", __func__, __LINE__);
+	fflush(stdout);
     pthread_create(&XlogStartupTid2, NULL, (void*)StartupXLOG, NULL);
 //    pthread_t tempTid;
 //    pthread_create(&tempTid, NULL, (void*)RecordReplayProgress, NULL);

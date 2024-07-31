@@ -1091,6 +1091,7 @@ ImportForeignSchemaStmt
 ImportForeignSchemaType
 ImportForeignSchema_function
 ImportQual
+InProgressEnt
 IncludeWal
 InclusionOpaque
 IncrementVarSublevelsUp_context
@@ -2124,6 +2125,7 @@ ReadExtraTocPtrType
 ReadFunc
 ReassignOwnedStmt
 RecheckForeignScan_function
+RecordCacheArrayEntry
 RecordCacheEntry
 RecordCompareData
 RecordIOData
@@ -2592,6 +2594,7 @@ TSQuerySign
 TSReadPointer
 TSTemplateInfo
 TSTernaryValue
+TSTokenTypeItem
 TSTokenTypeStorage
 TSVector
 TSVectorBuildState
@@ -3274,6 +3277,7 @@ mbstr_verifier
 memoize_hash
 memoize_iterator
 metastring
+missing_cache_key
 mix_data_t
 mixedStruct
 mode_t
@@ -3702,6 +3706,7 @@ xl_logical_message
 xl_multi_insert_tuple
 xl_multixact_create
 xl_multixact_truncate
+xl_overwrite_contrecord
 xl_parameter_change
 xl_relmap_update
 xl_replorigin_drop

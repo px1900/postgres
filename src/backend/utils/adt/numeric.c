@@ -4089,7 +4089,7 @@ int64_to_numeric(int64 val)
 }
 
 /*
- * Convert val1/(10**val2) to numeric.  This is much faster than normal
+ * Convert val1/(10**log10val2) to numeric.  This is much faster than normal
  * numeric division.
  */
 Numeric
@@ -4097,50 +4097,78 @@ int64_div_fast_to_numeric(int64 val1, int log10val2)
 {
 	Numeric		res;
 	NumericVar	result;
-	int64		saved_val1 = val1;
+	int			rscale;
 	int			w;
 	int			m;
 
+	init_var(&result);
+
+	/* result scale */
+	rscale = log10val2 < 0 ? 0 : log10val2;
+
 	/* how much to decrease the weight by */
 	w = log10val2 / DEC_DIGITS;
-	/* how much is left */
+	/* how much is left to divide by */
 	m = log10val2 % DEC_DIGITS;
+	if (m < 0)
+	{
+		m += DEC_DIGITS;
+		w--;
+	}
 
 	/*
-	 * If there is anything left, multiply the dividend by what's left, then
-	 * shift the weight by one more.
+	 * If there is anything left to divide by (10^m with 0 < m < DEC_DIGITS),
+	 * multiply the dividend by 10^(DEC_DIGITS - m), and shift the weight by
+	 * one more.
 	 */
 	if (m > 0)
 	{
-		static int	pow10[] = {1, 10, 100, 1000};
+#if DEC_DIGITS == 4
+		static const int pow10[] = {1, 10, 100, 1000};
+#elif DEC_DIGITS == 2
+		static const int pow10[] = {1, 10};
+#elif DEC_DIGITS == 1
+		static const int pow10[] = {1};
+#else
+#error unsupported NBASE
+#endif
+		int64		factor = pow10[DEC_DIGITS - m];
+		int64		new_val1;
 
 		StaticAssertStmt(lengthof(pow10) == DEC_DIGITS, "mismatch with DEC_DIGITS");
-		if (unlikely(pg_mul_s64_overflow(val1, pow10[DEC_DIGITS - m], &val1)))
-		{
-			/*
-			 * If it doesn't fit, do the whole computation in numeric the slow
-			 * way.  Note that va1l may have been overwritten, so use
-			 * saved_val1 instead.
-			 */
-			int			val2 = 1;
 
-			for (int i = 0; i < log10val2; i++)
-				val2 *= 10;
-			res = numeric_div_opt_error(int64_to_numeric(saved_val1), int64_to_numeric(val2), NULL);
-			res = DatumGetNumeric(DirectFunctionCall2(numeric_round,
-													  NumericGetDatum(res),
-													  Int32GetDatum(log10val2)));
-			return res;
+		if (unlikely(pg_mul_s64_overflow(val1, factor, &new_val1)))
+		{
+#ifdef HAVE_INT128
+			/* do the multiplication using 128-bit integers */
+			int128		tmp;
+
+			tmp = (int128) val1 * (int128) factor;
+
+			int128_to_numericvar(tmp, &result);
+#else
+			/* do the multiplication using numerics */
+			NumericVar	tmp;
+
+			init_var(&tmp);
+
+			int64_to_numericvar(val1, &result);
+			int64_to_numericvar(factor, &tmp);
+			mul_var(&result, &tmp, &result, 0);
+
+			free_var(&tmp);
+#endif
 		}
+		else
+			int64_to_numericvar(new_val1, &result);
+
 		w++;
 	}
-
-	init_var(&result);
-
-	int64_to_numericvar(val1, &result);
+	else
+		int64_to_numericvar(val1, &result);
 
 	result.weight -= w;
-	result.dscale += w * DEC_DIGITS - (DEC_DIGITS - m);
+	result.dscale = rscale;
 
 	res = make_result(&result);
 
@@ -9868,11 +9896,19 @@ exp_var(const NumericVar *arg, NumericVar *result, int rscale)
  *
  * Essentially, we're approximating log10(abs(ln(var))).  This is used to
  * determine the appropriate rscale when computing natural logarithms.
+ *
+ * Note: many callers call this before range-checking the input.  Therefore,
+ * we must be robust against values that are invalid to apply ln() to.
+ * We don't wish to throw an error here, so just return zero in such cases.
  */
 static int
 estimate_ln_dweight(const NumericVar *var)
 {
 	int			ln_dweight;
+
+	/* Caller should fail on ln(negative), but for the moment return zero */
+	if (var->sign != NUMERIC_POS)
+		return 0;
 
 	if (cmp_var(var, &const_zero_point_nine) >= 0 &&
 		cmp_var(var, &const_one_point_one) <= 0)
@@ -10227,9 +10263,13 @@ power_var(const NumericVar *base, const NumericVar *exp, NumericVar *result)
 	 */
 	ln_dweight = estimate_ln_dweight(base);
 
+	/*
+	 * Set the scale for the low-precision calculation, computing ln(base) to
+	 * around 8 significant digits.  Note that ln_dweight may be as small as
+	 * -SHRT_MAX, so the scale may exceed NUMERIC_MAX_DISPLAY_SCALE here.
+	 */
 	local_rscale = 8 - ln_dweight;
 	local_rscale = Max(local_rscale, NUMERIC_MIN_DISPLAY_SCALE);
-	local_rscale = Min(local_rscale, NUMERIC_MAX_DISPLAY_SCALE);
 
 	ln_var(base, &ln_base, local_rscale);
 

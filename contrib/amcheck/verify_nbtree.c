@@ -31,6 +31,7 @@
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_opfamily_d.h"
 #include "commands/tablecmds.h"
 #include "lib/bloomfilter.h"
 #include "miscadmin.h"
@@ -145,6 +146,9 @@ static void bt_check_every_level(Relation rel, Relation heaprel,
 								 bool rootdescend);
 static BtreeLevel bt_check_level_from_leftmost(BtreeCheckState *state,
 											   BtreeLevel level);
+static bool bt_leftmost_ignoring_half_dead(BtreeCheckState *state,
+										   BlockNumber start,
+										   BTPageOpaque start_opaque);
 static void bt_recheck_sibling_links(BtreeCheckState *state,
 									 BlockNumber btpo_prev_from_target,
 									 BlockNumber leftcurrent);
@@ -248,6 +252,9 @@ bt_index_check_internal(Oid indrelid, bool parentcheck, bool heapallindexed,
 	Relation	indrel;
 	Relation	heaprel;
 	LOCKMODE	lockmode;
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
 
 	if (parentcheck)
 		lockmode = ShareLock;
@@ -264,9 +271,27 @@ bt_index_check_internal(Oid indrelid, bool parentcheck, bool heapallindexed,
 	 */
 	heapid = IndexGetRelation(indrelid, true);
 	if (OidIsValid(heapid))
+	{
 		heaprel = table_open(heapid, lockmode);
+
+		/*
+		 * Switch to the table owner's userid, so that any index functions are
+		 * run as that user.  Also lock down security-restricted operations
+		 * and arrange to make GUC variable changes local to this command.
+		 */
+		GetUserIdAndSecContext(&save_userid, &save_sec_context);
+		SetUserIdAndSecContext(heaprel->rd_rel->relowner,
+							   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+		save_nestlevel = NewGUCNestLevel();
+	}
 	else
+	{
 		heaprel = NULL;
+		/* Set these just to suppress "uninitialized variable" warnings */
+		save_userid = InvalidOid;
+		save_sec_context = -1;
+		save_nestlevel = -1;
+	}
 
 	/*
 	 * Open the target index relations separately (like relation_openrv(), but
@@ -301,8 +326,7 @@ bt_index_check_internal(Oid indrelid, bool parentcheck, bool heapallindexed,
 		bool		heapkeyspace,
 					allequalimage;
 
-		RelationOpenSmgr(indrel);
-		if (!smgrexists(indrel->rd_smgr, MAIN_FORKNUM))
+		if (!smgrexists(RelationGetSmgr(indrel), MAIN_FORKNUM))
 			ereport(ERROR,
 					(errcode(ERRCODE_INDEX_CORRUPTED),
 					 errmsg("index \"%s\" lacks a main relation fork",
@@ -316,15 +340,31 @@ bt_index_check_internal(Oid indrelid, bool parentcheck, bool heapallindexed,
 					 errmsg("index \"%s\" metapage has equalimage field set on unsupported nbtree version",
 							RelationGetRelationName(indrel))));
 		if (allequalimage && !_bt_allequalimage(indrel, false))
+		{
+			bool		has_interval_ops = false;
+
+			for (int i = 0; i < IndexRelationGetNumberOfKeyAttributes(indrel); i++)
+				if (indrel->rd_opfamily[i] == INTERVAL_BTREE_FAM_OID)
+					has_interval_ops = true;
 			ereport(ERROR,
 					(errcode(ERRCODE_INDEX_CORRUPTED),
 					 errmsg("index \"%s\" metapage incorrectly indicates that deduplication is safe",
-							RelationGetRelationName(indrel))));
+							RelationGetRelationName(indrel)),
+					 has_interval_ops
+					 ? errhint("This is known of \"interval\" indexes last built on a version predating 2023-11.")
+					 : 0));
+		}
 
 		/* Check index, possibly against table it is an index on */
 		bt_check_every_level(indrel, heaprel, heapkeyspace, parentcheck,
 							 heapallindexed, rootdescend);
 	}
+
+	/* Roll back any GUC changes executed by index functions */
+	AtEOXact_GUC(false, save_nestlevel);
+
+	/* Restore userid and security context */
+	SetUserIdAndSecContext(save_userid, save_sec_context);
 
 	/*
 	 * Release locks early. That's ok here because nothing in the called
@@ -373,7 +413,8 @@ btree_index_checkable(Relation rel)
 /*
  * Check if B-Tree index relation should have a file for its main relation
  * fork.  Verification uses this to skip unlogged indexes when in hot standby
- * mode, where there is simply nothing to verify.
+ * mode, where there is simply nothing to verify.  We behave as if the
+ * relation is empty.
  *
  * NB: Caller should call btree_index_checkable() before calling here.
  */
@@ -384,7 +425,7 @@ btree_index_mainfork_expected(Relation rel)
 		!RecoveryInProgress())
 		return true;
 
-	ereport(NOTICE,
+	ereport(DEBUG1,
 			(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
 			 errmsg("cannot verify unlogged index \"%s\" during recovery, skipping",
 					RelationGetRelationName(rel))));
@@ -736,7 +777,7 @@ bt_check_level_from_leftmost(BtreeCheckState *state, BtreeLevel level)
 			 */
 			if (state->readonly)
 			{
-				if (!P_LEFTMOST(opaque))
+				if (!bt_leftmost_ignoring_half_dead(state, current, opaque))
 					ereport(ERROR,
 							(errcode(ERRCODE_INDEX_CORRUPTED),
 							 errmsg("block %u is not leftmost in index \"%s\"",
@@ -790,8 +831,16 @@ bt_check_level_from_leftmost(BtreeCheckState *state, BtreeLevel level)
 			 */
 		}
 
-		/* Sibling links should be in mutual agreement */
-		if (opaque->btpo_prev != leftcurrent)
+		/*
+		 * Sibling links should be in mutual agreement.  There arises
+		 * leftcurrent == P_NONE && btpo_prev != P_NONE when the left sibling
+		 * of the parent's low-key downlink is half-dead.  (A half-dead page
+		 * has no downlink from its parent.)  Under heavyweight locking, the
+		 * last bt_leftmost_ignoring_half_dead() validated this btpo_prev.
+		 * Without heavyweight locking, validation of the P_NONE case remains
+		 * unimplemented.
+		 */
+		if (opaque->btpo_prev != leftcurrent && leftcurrent != P_NONE)
 			bt_recheck_sibling_links(state, opaque->btpo_prev, leftcurrent);
 
 		/* Check level */
@@ -873,6 +922,66 @@ nextpage:
 }
 
 /*
+ * Like P_LEFTMOST(start_opaque), but accept an arbitrarily-long chain of
+ * half-dead, sibling-linked pages to the left.  If a half-dead page appears
+ * under state->readonly, the database exited recovery between the first-stage
+ * and second-stage WAL records of a deletion.
+ */
+static bool
+bt_leftmost_ignoring_half_dead(BtreeCheckState *state,
+							   BlockNumber start,
+							   BTPageOpaque start_opaque)
+{
+	BlockNumber reached = start_opaque->btpo_prev,
+				reached_from = start;
+	bool		all_half_dead = true;
+
+	/*
+	 * To handle the !readonly case, we'd need to accept BTP_DELETED pages and
+	 * potentially observe nbtree/README "Page deletion and backwards scans".
+	 */
+	Assert(state->readonly);
+
+	while (reached != P_NONE && all_half_dead)
+	{
+		Page		page = palloc_btree_page(state, reached);
+		BTPageOpaque reached_opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Try to detect btpo_prev circular links.  _bt_unlink_halfdead_page()
+		 * writes that side-links will continue to point to the siblings.
+		 * Check btpo_next for that property.
+		 */
+		all_half_dead = P_ISHALFDEAD(reached_opaque) &&
+			reached != start &&
+			reached != reached_from &&
+			reached_opaque->btpo_next == reached_from;
+		if (all_half_dead)
+		{
+			XLogRecPtr	pagelsn = PageGetLSN(page);
+
+			/* pagelsn should point to an XLOG_BTREE_MARK_PAGE_HALFDEAD */
+			ereport(DEBUG1,
+					(errcode(ERRCODE_NO_DATA),
+					 errmsg_internal("harmless interrupted page deletion detected in index \"%s\"",
+									 RelationGetRelationName(state->rel)),
+					 errdetail_internal("Block=%u right block=%u page lsn=%X/%X.",
+										reached, reached_from,
+										LSN_FORMAT_ARGS(pagelsn))));
+
+			reached_from = reached;
+			reached = reached_opaque->btpo_prev;
+		}
+
+		pfree(page);
+	}
+
+	return all_half_dead;
+}
+
+/*
  * Raise an error when target page's left link does not point back to the
  * previous target page, called leftcurrent here.  The leftcurrent page's
  * right link was followed to get to the current target page, and we expect
@@ -912,6 +1021,9 @@ bt_recheck_sibling_links(BtreeCheckState *state,
 						 BlockNumber btpo_prev_from_target,
 						 BlockNumber leftcurrent)
 {
+	/* taking BTPageOpaque from metapage would give irrelevant findings */
+	Assert(leftcurrent != P_NONE);
+
 	if (!state->readonly)
 	{
 		Buffer		lbuf;
@@ -1511,7 +1623,7 @@ bt_target_page_check(BtreeCheckState *state)
 	/*
 	 * Special case bt_child_highkey_check() call
 	 *
-	 * We don't pass an real downlink, but we've to finish the level
+	 * We don't pass a real downlink, but we've to finish the level
 	 * processing. If condition is satisfied, we've already processed all the
 	 * downlinks from the target level.  But there still might be pages to the
 	 * right of the child page pointer to by our rightmost downlink.  And they
@@ -1895,7 +2007,8 @@ bt_child_highkey_check(BtreeCheckState *state,
 		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 
 		/* The first page we visit at the level should be leftmost */
-		if (first && !BlockNumberIsValid(state->prevrightlink) && !P_LEFTMOST(opaque))
+		if (first && !BlockNumberIsValid(state->prevrightlink) &&
+			!bt_leftmost_ignoring_half_dead(state, blkno, opaque))
 			ereport(ERROR,
 					(errcode(ERRCODE_INDEX_CORRUPTED),
 					 errmsg("the first child of leftmost target page is not leftmost of its level in index \"%s\"",

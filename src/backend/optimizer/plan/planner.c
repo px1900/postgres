@@ -319,11 +319,13 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	 * functions are present in the query tree.
 	 *
 	 * (Note that we do allow CREATE TABLE AS, SELECT INTO, and CREATE
-	 * MATERIALIZED VIEW to use parallel plans, but as of now, only the leader
-	 * backend writes into a completely new table.  In the future, we can
-	 * extend it to allow workers to write into the table.  However, to allow
-	 * parallel updates and deletes, we have to solve other problems,
-	 * especially around combo CIDs.)
+	 * MATERIALIZED VIEW to use parallel plans, but this is safe only because
+	 * the command is writing into a completely new table which workers won't
+	 * be able to see.  If the workers could see the table, the fact that
+	 * group locking would cause them to ignore the leader's heavyweight
+	 * GIN page locks would make this unsafe.  We'll have to fix that somehow
+	 * if we want to allow parallel inserts in general; updates and deletes
+	 * have additional problems especially around combo CIDs.)
 	 *
 	 * For now, we don't try to use parallel mode if we're running inside a
 	 * parallel worker.  We might eventually be able to relax this
@@ -425,12 +427,10 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 		Gather	   *gather = makeNode(Gather);
 
 		/*
-		 * If there are any initPlans attached to the formerly-top plan node,
-		 * move them up to the Gather node; same as we do for Material node in
-		 * materialize_finished_plan.
+		 * Top plan must not have any initPlans, else it shouldn't have been
+		 * marked parallel-safe.
 		 */
-		gather->plan.initPlan = top_plan->initPlan;
-		top_plan->initPlan = NIL;
+		Assert(top_plan->initPlan == NIL);
 
 		gather->plan.targetlist = top_plan->targetlist;
 		gather->plan.qual = NIL;
@@ -1078,8 +1078,10 @@ preprocess_expression(PlannerInfo *root, Node *expr, int kind)
 
 	/*
 	 * Simplify constant expressions.  For function RTEs, this was already
-	 * done by preprocess_function_rtes ... but we have to do it again if the
-	 * RTE is LATERAL and might have contained join alias variables.
+	 * done by preprocess_function_rtes.  (But note we must do it again for
+	 * EXPRKIND_RTFUNC_LATERAL, because those might by now contain
+	 * un-simplified subexpressions inserted by flattening of subqueries or
+	 * join alias variables.)
 	 *
 	 * Note: an essential effect of this is to convert named-argument function
 	 * calls to positional notation and insert the current actual values of
@@ -1093,8 +1095,7 @@ preprocess_expression(PlannerInfo *root, Node *expr, int kind)
 	 * careful to maintain AND/OR flatness --- that is, do not generate a tree
 	 * with AND directly under AND, nor OR directly under OR.
 	 */
-	if (!(kind == EXPRKIND_RTFUNC ||
-		  (kind == EXPRKIND_RTFUNC_LATERAL && !root->hasJoinRTEs)))
+	if (kind != EXPRKIND_RTFUNC)
 		expr = eval_const_expressions(root, expr);
 
 	/*
@@ -1724,6 +1725,9 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 														   parse->resultRelation);
 				int			resultRelation = -1;
 
+				/* Pass the root result rel forward to the executor. */
+				rootRelation = parse->resultRelation;
+
 				/* Add only leaf children to ModifyTable. */
 				while ((resultRelation = bms_next_member(root->leaf_result_relids,
 														 resultRelation)) >= 0)
@@ -1808,6 +1812,7 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 			else
 			{
 				/* Single-relation INSERT/UPDATE/DELETE. */
+				rootRelation = 0;	/* there's no separate root rel */
 				resultRelations = list_make1_int(parse->resultRelation);
 				if (parse->commandType == CMD_UPDATE)
 					updateColnosLists = list_make1(root->update_colnos);
@@ -1816,16 +1821,6 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 				if (parse->returningList)
 					returningLists = list_make1(parse->returningList);
 			}
-
-			/*
-			 * If target is a partition root table, we need to mark the
-			 * ModifyTable node appropriately for that.
-			 */
-			if (rt_fetch(parse->resultRelation, parse->rtable)->relkind ==
-				RELKIND_PARTITIONED_TABLE)
-				rootRelation = parse->resultRelation;
-			else
-				rootRelation = 0;
 
 			/*
 			 * If there was a FOR [KEY] UPDATE/SHARE clause, the LockRows node

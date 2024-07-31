@@ -46,6 +46,7 @@
 #include "catalog/storage.h"
 #include "commands/async.h"
 #include "commands/prepare.h"
+#include "commands/tablespace.h"
 #include "commands/trigger.h"
 #include "commands/user.h"
 #include "commands/vacuum.h"
@@ -409,6 +410,7 @@ static const struct config_enum_entry backslash_quote_options[] = {
  */
 static const struct config_enum_entry compute_query_id_options[] = {
 	{"auto", COMPUTE_QUERY_ID_AUTO, false},
+	{"regress", COMPUTE_QUERY_ID_REGRESS, false},
 	{"on", COMPUTE_QUERY_ID_ON, false},
 	{"off", COMPUTE_QUERY_ID_OFF, false},
 	{"true", COMPUTE_QUERY_ID_ON, true},
@@ -1224,7 +1226,7 @@ static struct config_bool ConfigureNamesBool[] =
 		{"fsync", PGC_SIGHUP, WAL_SETTINGS,
 			gettext_noop("Forces synchronization of updates to disk."),
 			gettext_noop("The server will use the fsync() system call in several places to make "
-						 "sure that updates are physically written to disk. This insures "
+						 "sure that updates are physically written to disk. This ensures "
 						 "that a database cluster will recover to a consistent state after "
 						 "an operating system or hardware crash.")
 		},
@@ -1947,6 +1949,17 @@ static struct config_bool ConfigureNamesBool[] =
 			GUC_NOT_IN_SAMPLE
 		},
 		&IgnoreSystemIndexes,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"allow_in_place_tablespaces", PGC_SUSET, DEVELOPER_OPTIONS,
+			gettext_noop("Allows tablespaces directly inside pg_tblspc, for testing."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&allow_in_place_tablespaces,
 		false,
 		NULL, NULL, NULL
 	},
@@ -3785,7 +3798,7 @@ static struct config_real ConfigureNamesReal[] =
 		},
 		&CheckPointCompletionTarget,
 		0.9, 0.0, 1.0,
-		NULL, NULL, NULL
+		NULL, assign_checkpoint_completion_target, NULL
 	},
 
 	{
@@ -5389,13 +5402,13 @@ valid_custom_variable_name(const char *name)
 			name_start = true;
 		}
 		else if (strchr("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-						"abcdefghijklmnopqrstuvwxyz", *p) != NULL ||
+						"abcdefghijklmnopqrstuvwxyz_", *p) != NULL ||
 				 IS_HIGHBIT_SET(*p))
 		{
 			/* okay as first or non-first character */
 			name_start = false;
 		}
-		else if (!name_start && strchr("0123456789_$", *p) != NULL)
+		else if (!name_start && strchr("0123456789$", *p) != NULL)
 			 /* okay as non-first character */ ;
 		else
 			return false;
@@ -7316,9 +7329,12 @@ set_config_option(const char *name, const char *value,
 	 * Other changes might need to affect other workers, so forbid them.
 	 */
 	if (IsInParallelMode() && changeVal && action != GUC_ACTION_SAVE)
+	{
 		ereport(elevel,
 				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
 				 errmsg("cannot set parameters during a parallel operation")));
+		return -1;
+	}
 
 	record = find_option(name, true, false, elevel);
 	if (record == NULL)
@@ -7403,6 +7419,10 @@ set_config_option(const char *name, const char *value,
 				 * backends.  This is a tad klugy, but necessary because we
 				 * don't re-read the config file during backend start.
 				 *
+				 * However, if changeVal is false then plow ahead anyway since
+				 * we are trying to find out if the value is potentially good,
+				 * not actually use it.
+				 *
 				 * In EXEC_BACKEND builds, this works differently: we load all
 				 * non-default settings from the CONFIG_EXEC_PARAMS file
 				 * during backend start.  In that case we must accept
@@ -7413,7 +7433,7 @@ set_config_option(const char *name, const char *value,
 				 * started it. is_reload will be true when either situation
 				 * applies.
 				 */
-				if (IsUnderPostmaster && !is_reload)
+				if (IsUnderPostmaster && changeVal && !is_reload)
 					return -1;
 			}
 			else if (context != PGC_POSTMASTER &&
@@ -9414,7 +9434,16 @@ ShowAllGUCConfig(DestReceiver *dest)
 			isnull[1] = true;
 		}
 
-		values[2] = PointerGetDatum(cstring_to_text(conf->short_desc));
+		if (conf->short_desc)
+		{
+			values[2] = PointerGetDatum(cstring_to_text(conf->short_desc));
+			isnull[2] = false;
+		}
+		else
+		{
+			values[2] = PointerGetDatum(NULL);
+			isnull[2] = true;
+		}
 
 		/* send it to dest */
 		do_tup_output(tstate, values, isnull);
@@ -9426,7 +9455,8 @@ ShowAllGUCConfig(DestReceiver *dest)
 			pfree(setting);
 			pfree(DatumGetPointer(values[1]));
 		}
-		pfree(DatumGetPointer(values[2]));
+		if (conf->short_desc)
+			pfree(DatumGetPointer(values[2]));
 	}
 
 	end_tup_output(tstate);
@@ -9499,7 +9529,14 @@ get_explain_guc_options(int *num)
 				{
 					struct config_string *lconf = (struct config_string *) conf;
 
-					modified = (strcmp(lconf->boot_val, *(lconf->variable)) != 0);
+					if (lconf->boot_val == NULL &&
+						*lconf->variable == NULL)
+						modified = false;
+					else if (lconf->boot_val == NULL ||
+							 *lconf->variable == NULL)
+						modified = true;
+					else
+						modified = (strcmp(lconf->boot_val, *(lconf->variable)) != 0);
 				}
 				break;
 
@@ -9597,10 +9634,10 @@ GetConfigOptionByNum(int varnum, const char **values, bool *noshow)
 	values[3] = _(config_group_names[conf->group]);
 
 	/* short_desc */
-	values[4] = _(conf->short_desc);
+	values[4] = conf->short_desc != NULL ? _(conf->short_desc) : NULL;
 
 	/* extra_desc */
-	values[5] = _(conf->long_desc);
+	values[5] = conf->long_desc != NULL ? _(conf->long_desc) : NULL;
 
 	/* context */
 	values[6] = GucContext_Names[conf->context];
@@ -10246,7 +10283,8 @@ write_one_nondefault_variable(FILE *fp, struct config_generic *gconf)
 			{
 				struct config_string *conf = (struct config_string *) gconf;
 
-				fprintf(fp, "%s", *conf->variable);
+				if (*conf->variable)
+					fprintf(fp, "%s", *conf->variable);
 			}
 			break;
 

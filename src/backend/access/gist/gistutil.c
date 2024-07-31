@@ -805,9 +805,10 @@ gistcheckpage(Relation rel, Buffer buf)
 	if (PageGetSpecialSize(page) != MAXALIGN(sizeof(GISTPageOpaqueData)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("index \"%s\" contains corrupted page at block %u",
+				 errmsg("gin index \"%s\" contains corrupted page at block %u, spc %u, db %u, rel %u",
 						RelationGetRelationName(rel),
 						BufferGetBlockNumber(buf)),
+						rel->rd_node.spcNode, rel->rd_node.dbNode, rel->rd_node.relNode,
 				 errhint("Please REINDEX it.")));
 }
 

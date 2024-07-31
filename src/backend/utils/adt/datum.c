@@ -43,6 +43,8 @@
 #include "postgres.h"
 
 #include "access/detoast.h"
+#include "catalog/pg_type_d.h"
+#include "common/hashfn.h"
 #include "fmgr.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -325,6 +327,57 @@ datum_image_eq(Datum value1, Datum value2, bool typByVal, int typLen)
 }
 
 /*-------------------------------------------------------------------------
+ * datum_image_hash
+ *
+ * Generate a hash value based on the binary representation of 'value'.  Most
+ * use cases will want to use the hash function specific to the Datum's type,
+ * however, some corner cases require generating a hash value based on the
+ * actual bits rather than the logical value.
+ *-------------------------------------------------------------------------
+ */
+uint32
+datum_image_hash(Datum value, bool typByVal, int typLen)
+{
+	Size		len;
+	uint32		result;
+
+	if (typByVal)
+		result = hash_bytes((unsigned char *) &value, sizeof(Datum));
+	else if (typLen > 0)
+		result = hash_bytes((unsigned char *) DatumGetPointer(value), typLen);
+	else if (typLen == -1)
+	{
+		struct varlena *val;
+
+		len = toast_raw_datum_size(value);
+
+		val = PG_DETOAST_DATUM_PACKED(value);
+
+		result = hash_bytes((unsigned char *) VARDATA_ANY(val), len - VARHDRSZ);
+
+		/* Only free memory if it's a copy made here. */
+		if ((Pointer) val != (Pointer) value)
+			pfree(val);
+	}
+	else if (typLen == -2)
+	{
+		char	   *s;
+
+		s = DatumGetCString(value);
+		len = strlen(s) + 1;
+
+		result = hash_bytes((unsigned char *) s, len);
+	}
+	else
+	{
+		elog(ERROR, "unexpected typLen: %d", typLen);
+		result = 0;				/* keep compiler quiet */
+	}
+
+	return result;
+}
+
+/*-------------------------------------------------------------------------
  * btequalimage
  *
  * Generic "equalimage" support function.
@@ -333,20 +386,17 @@ datum_image_eq(Datum value1, Datum value2, bool typByVal, int typLen)
  * datum_image_eq() in all cases can use this as their "equalimage" support
  * function.
  *
- * Currently, we unconditionally assume that any B-Tree operator class that
- * registers btequalimage as its support function 4 must be able to safely use
- * optimizations like deduplication (i.e. we return true unconditionally).  If
- * it ever proved necessary to rescind support for an operator class, we could
- * do that in a targeted fashion by doing something with the opcintype
- * argument.
+ * Earlier minor releases erroneously associated this function with
+ * interval_ops.  Detect that case to rescind deduplication support, without
+ * requiring initdb.
  *-------------------------------------------------------------------------
  */
 Datum
 btequalimage(PG_FUNCTION_ARGS)
 {
-	/* Oid		opcintype = PG_GETARG_OID(0); */
+	Oid			opcintype = PG_GETARG_OID(0);
 
-	PG_RETURN_BOOL(true);
+	PG_RETURN_BOOL(opcintype != INTERVALOID);
 }
 
 /*-------------------------------------------------------------------------

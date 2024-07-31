@@ -417,7 +417,9 @@ hostnogssenc  <replaceable>database</replaceable>  <replaceable>user</replaceabl
       <para>
        Specifies the authentication method to use when a connection matches
        this record. The possible choices are summarized here; details
-       are in <xref linkend="auth-methods"/>.
+       are in <xref linkend="auth-methods"/>.  All the options
+       are lower case and treated case sensitively, so even acronyms like
+       <literal>ldap</literal> must be specified as lower case.
 
        <variablelist>
         <varlistentry>
@@ -629,7 +631,7 @@ hostnogssenc  <replaceable>database</replaceable>  <replaceable>user</replaceabl
        format. To see the <literal>DN</literal> of a client certificate
        in this format, do
 <programlisting>
-openssl x509 -in myclient.crt -noout --subject -nameopt RFC2253 | sed "s/^subject=//"
+openssl x509 -in myclient.crt -noout -subject -nameopt RFC2253 | sed "s/^subject=//"
 </programlisting>
         Care needs to be taken when using this option, especially when using
         regular expression matching against the <literal>DN</literal>.
@@ -1386,10 +1388,12 @@ omicron         bryanh                  guest1
     <literal>negotiate</literal> mode, which will use
     <productname>Kerberos</productname> when possible and automatically
     fall back to <productname>NTLM</productname> in other cases.
-    <productname>SSPI</productname> authentication only works when both
-    server and client are running <productname>Windows</productname>,
-    or, on non-Windows platforms, when <productname>GSSAPI</productname>
-    is available.
+    <productname>SSPI</productname> and <productname>GSSAPI</productname>
+    interoperate as clients and servers, e.g., an
+    <productname>SSPI</productname> client can authenticate to an
+    <productname>GSSAPI</productname> server.  It is recommended to use
+    <productname>SSPI</productname> on Windows clients and servers and
+    <productname>GSSAPI</productname> on non-Windows platforms.
    </para>
 
    <para>
@@ -2046,7 +2050,8 @@ host ... radius radiusservers="server1,server2" radiussecrets="""secret one"",""
 
    <para>
     This authentication method uses SSL client certificates to perform
-    authentication. It is therefore only available for SSL connections.
+    authentication. It is therefore only available for SSL connections;
+    see <xref linkend="ssl-openssl-config"/> for SSL configuration instructions.
     When using this authentication method, the server will require that
     the client provide a valid, trusted certificate.  No password prompt
     will be sent to the client.  The <literal>cn</literal> (Common Name)

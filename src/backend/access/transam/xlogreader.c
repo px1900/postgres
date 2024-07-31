@@ -46,7 +46,7 @@ int pg_pread_rpc_local2(int fd, char *p, int amount, int offset) {
 
 static void report_invalid_record(XLogReaderState *state, const char *fmt,...)
 			pg_attribute_printf(2, 3);
-static bool allocate_recordbuf(XLogReaderState *state, uint32 reclength);
+static void allocate_recordbuf(XLogReaderState *state, uint32 reclength);
 static int	ReadPageInternal(XLogReaderState *state, XLogRecPtr pageptr,
 							 int reqLen);
 static void XLogReaderInvalReadState(XLogReaderState *state);
@@ -135,14 +135,7 @@ XLogReaderAllocate(int wal_segment_size, const char *waldir,
 	 * Allocate an initial readRecordBuf of minimal size, which can later be
 	 * enlarged if necessary.
 	 */
-	if (!allocate_recordbuf(state, 0))
-	{
-		pfree(state->errormsg_buf);
-		pfree(state->readBuf);
-		pfree(state);
-		return NULL;
-	}
-
+	allocate_recordbuf(state, 0);
 	return state;
 }
 
@@ -171,7 +164,6 @@ XLogReaderFree(XLogReaderState *state)
 
 /*
  * Allocate readRecordBuf to fit a record of at least the given length.
- * Returns true if successful, false if out of memory.
  *
  * readRecordBufSize is set to the new buffer size.
  *
@@ -179,8 +171,11 @@ XLogReaderFree(XLogReaderState *state)
  * XLOG_BLCKSZ, and make sure it's at least 5*Max(BLCKSZ, XLOG_BLCKSZ) to start
  * with.  (That is enough for all "normal" records, but very large commit or
  * abort records might need more space.)
+ *
+ * Note: This routine should *never* be called for xl_tot_len until the header
+ * of the record has been fully validated.
  */
-static bool
+static void
 allocate_recordbuf(XLogReaderState *state, uint32 reclength)
 {
 	uint32		newSize = reclength;
@@ -188,36 +183,10 @@ allocate_recordbuf(XLogReaderState *state, uint32 reclength)
 	newSize += XLOG_BLCKSZ - (newSize % XLOG_BLCKSZ);
 	newSize = Max(newSize, 5 * Max(BLCKSZ, XLOG_BLCKSZ));
 
-#ifndef FRONTEND
-
-	/*
-	 * Note that in much unlucky circumstances, the random data read from a
-	 * recycled segment can cause this routine to be called with a size
-	 * causing a hard failure at allocation.  For a standby, this would cause
-	 * the instance to stop suddenly with a hard failure, preventing it to
-	 * retry fetching WAL from one of its sources which could allow it to move
-	 * on with replay without a manual restart. If the data comes from a past
-	 * recycled segment and is still valid, then the allocation may succeed
-	 * but record checks are going to fail so this would be short-lived.  If
-	 * the allocation fails because of a memory shortage, then this is not a
-	 * hard failure either per the guarantee given by MCXT_ALLOC_NO_OOM.
-	 */
-	if (!AllocSizeIsValid(newSize))
-		return false;
-
-#endif
-
 	if (state->readRecordBuf)
 		pfree(state->readRecordBuf);
-	state->readRecordBuf =
-		(char *) palloc_extended(newSize, MCXT_ALLOC_NO_OOM);
-	if (state->readRecordBuf == NULL)
-	{
-		state->readRecordBufSize = 0;
-		return false;
-	}
+	state->readRecordBuf = (char *) palloc(newSize);
 	state->readRecordBufSize = newSize;
-	return true;
 }
 
 /*
@@ -286,6 +255,7 @@ XLogReadRecord(XLogReaderState *state, char **errormsg)
 				total_len;
 	uint32		targetRecOff;
 	uint32		pageHeaderSize;
+	bool		assembled;
 	bool		gotheader;
 	int			readOff;
 
@@ -301,6 +271,8 @@ XLogReadRecord(XLogReaderState *state, char **errormsg)
 	state->errormsg_buf[0] = '\0';
 
 	ResetDecoder(state);
+	state->abortedRecPtr = InvalidXLogRecPtr;
+	state->missingContrecPtr = InvalidXLogRecPtr;
 
 	RecPtr = state->EndRecPtr;
 
@@ -327,7 +299,9 @@ XLogReadRecord(XLogReaderState *state, char **errormsg)
 		randAccess = true;
 	}
 
+restart:
 	state->currRecPtr = RecPtr;
+	assembled = false;
 
 	targetPagePtr = RecPtr - (RecPtr % XLOG_BLCKSZ);
 	targetRecOff = RecPtr % XLOG_BLCKSZ;
@@ -438,7 +412,7 @@ XLogReadRecord(XLogReaderState *state, char **errormsg)
         printf("%s %d \n", __func__ , __LINE__);
         fflush(stdout);
 #endif
-		/* XXX: more validation should be done here */
+		/* There may be no next page if it's too small. */
 		if (total_len < SizeOfXLogRecord)
 		{
 #ifdef ENABLE_DEBUG_INFO
@@ -451,6 +425,7 @@ XLogReadRecord(XLogReaderState *state, char **errormsg)
 								  (uint32) SizeOfXLogRecord, total_len);
 			goto err;
 		}
+		/* We'll validate the header once we have the next page. */
 		gotheader = false;
 	}
 
@@ -471,21 +446,14 @@ XLogReadRecord(XLogReaderState *state, char **errormsg)
 		char	   *buffer;
 		uint32		gotlen;
 
+		assembled = true;
+
 		/*
-		 * Enlarge readRecordBuf as needed.
+		 * We always have space for a couple of pages, enough to validate a
+		 * boundary-spanning record header.
 		 */
-		if (total_len > state->readRecordBufSize &&
-			!allocate_recordbuf(state, total_len))
-		{
-#ifdef ENABLE_DEBUG_INFO
-            printf("%s %d \n", __func__ , __LINE__);
-            fflush(stdout);
-#endif
-			/* We treat this as a "bogus data" condition */
-			report_invalid_record(state, "record length %u at %X/%X too long",
-								  total_len, LSN_FORMAT_ARGS(RecPtr));
-			goto err;
-		}
+		Assert(state->readRecordBufSize >= XLOG_BLCKSZ * 2);
+		Assert(state->readRecordBufSize >= len);
 
 		/* Copy the first fragment of the record from the first page. */
 		memcpy(state->readRecordBuf,
@@ -516,8 +484,25 @@ XLogReadRecord(XLogReaderState *state, char **errormsg)
 
 			Assert(SizeOfXLogShortPHD <= readOff);
 
-			/* Check that the continuation on next page looks valid */
 			pageHeader = (XLogPageHeader) state->readBuf;
+
+			/*
+			 * If we were expecting a continuation record and got an
+			 * "overwrite contrecord" flag, that means the continuation record
+			 * was overwritten with a different record.  Restart the read by
+			 * assuming the address to read is the location where we found
+			 * this flag; but keep track of the LSN of the record we were
+			 * reading, for later verification.
+			 */
+			if (pageHeader->xlp_info & XLP_FIRST_IS_OVERWRITE_CONTRECORD)
+			{
+				state->overwrittenRecPtr = RecPtr;
+				ResetDecoder(state);
+				RecPtr = targetPagePtr;
+				goto restart;
+			}
+
+			/* Check that the continuation on next page looks valid */
 			if (!(pageHeader->xlp_info & XLP_FIRST_IS_CONTRECORD))
 			{
 #ifdef ENABLE_DEBUG_INFO
@@ -588,8 +573,30 @@ XLogReadRecord(XLogReaderState *state, char **errormsg)
 					goto err;
 				gotheader = true;
 			}
-		} while (gotlen < total_len);
 
+			/*
+			 * We might need a bigger buffer.  We have validated the record
+			 * header, in the case that it split over a page boundary.  We've
+			 * also cross-checked total_len against xlp_rem_len on the second
+			 * page, and verified xlp_pageaddr on both.
+			 */
+			Assert(gotheader);
+			if (total_len > state->readRecordBufSize)
+			{
+				char		save_copy[XLOG_BLCKSZ * 2];
+
+				/*
+				 * Save and restore the data we already had.  It can't be more
+				 * than two pages.
+				 */
+				Assert(gotlen <= lengthof(save_copy));
+				Assert(gotlen <= state->readRecordBufSize);
+				memcpy(save_copy, state->readRecordBuf, gotlen);
+				allocate_recordbuf(state, total_len);
+				memcpy(state->readRecordBuf, save_copy, gotlen);
+				buffer = state->readRecordBuf + gotlen;
+			}
+		} while (gotlen < total_len);
 		Assert(gotheader);
 
 #ifdef ENABLE_DEBUG_INFO
@@ -663,6 +670,20 @@ XLogReadRecord(XLogReaderState *state, char **errormsg)
 		return NULL;
 
 err:
+	if (assembled)
+	{
+		/*
+		 * We get here when a record that spans multiple pages needs to be
+		 * assembled, but something went wrong -- perhaps a contrecord piece
+		 * was lost.  If caller is WAL replay, it will know where the aborted
+		 * record was and where to direct followup WAL to be written, marking
+		 * the next piece with XLP_FIRST_IS_OVERWRITE_CONTRECORD, which will
+		 * in turn signal downstream WAL consumers that the broken WAL record
+		 * is to be ignored.
+		 */
+		state->abortedRecPtr = RecPtr;
+		state->missingContrecPtr = targetPagePtr;
+	}
 
 #ifdef ENABLE_DEBUG_INFO
     printf("%s %d Error here \n", __func__ , __LINE__);
@@ -872,6 +893,8 @@ static bool
 ValidXLogRecord(XLogReaderState *state, XLogRecord *record, XLogRecPtr recptr)
 {
 	pg_crc32c	crc;
+
+	Assert(record->xl_tot_len >= SizeOfXLogRecord);
 
 	/* Calculate the CRC */
 	INIT_CRC32C(crc);
@@ -1295,6 +1318,7 @@ ResetDecoder(XLogReaderState *state)
 bool
 DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 {
+	printf("%s, %d, start decode the XLog with LSN %lu, xl_info=%d, rmgr_id=%d\n", __func__, __LINE__, state->currRecPtr, record->xl_info& ~XLR_INFO_MASK & 0x70, record->xl_rmid);
 	/*
 	 * read next _size bytes from record buffer, but check for overrun first.
 	 */
@@ -1322,6 +1346,7 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 	ptr = (char *) record;
 	ptr += SizeOfXLogRecord;
 	remaining = record->xl_tot_len - SizeOfXLogRecord;
+	printf("%s, %d, record total length %d, after subtract header %d, the buffer remaining = %u\n", __func__, __LINE__, record->xl_tot_len, SizeOfXLogRecord, remaining);
 
 	/* Decode the headers */
 	datatotal = 0;
@@ -1331,6 +1356,7 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 
 		if (block_id == XLR_BLOCK_ID_DATA_SHORT)
 		{
+			printf("%s, %d, block_id = %d, XLR_BLOCK_ID_DATA_SHORT\n", __func__, __LINE__, block_id);
 			/* XLogRecordDataHeaderShort */
 			uint8		main_data_len;
 
@@ -1343,6 +1369,7 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 		}
 		else if (block_id == XLR_BLOCK_ID_DATA_LONG)
 		{
+			printf("%s, %d, block_id = %d, XLR_BLOCK_ID_DATA_LONG\n", __func__, __LINE__, block_id);
 			/* XLogRecordDataHeaderLong */
 			uint32		main_data_len;
 
@@ -1354,14 +1381,17 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 		}
 		else if (block_id == XLR_BLOCK_ID_ORIGIN)
 		{
+			printf("%s, %d, block_id = %d, XLR_BLOCK_ID_ORIGIN\n", __func__, __LINE__, block_id);
 			COPY_HEADER_FIELD(&state->record_origin, sizeof(RepOriginId));
 		}
 		else if (block_id == XLR_BLOCK_ID_TOPLEVEL_XID)
 		{
+			printf("%s, %d, block_id = %d, XLR_BLOCK_ID_TOPLEVEL_XID\n", __func__, __LINE__, block_id);
 			COPY_HEADER_FIELD(&state->toplevel_xid, sizeof(TransactionId));
 		}
 		else if (block_id <= XLR_MAX_BLOCK_ID)
 		{
+			printf("%s, %d, block_id = %d, start processing block\n", __func__, __LINE__, block_id);
 			/* XLogRecordBlockHeader */
 			DecodedBkpBlock *blk;
 			uint8		fork_flags;
@@ -1514,6 +1544,8 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 		}
 	}
 
+	printf("%s, %d, datatotal = %d, main_data_len = %d\n", __func__, __LINE__, datatotal, state->main_data_len);
+	fflush(stdout);
 	if (remaining != datatotal)
 		goto shortdata_err;
 

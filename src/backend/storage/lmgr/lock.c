@@ -185,18 +185,6 @@ static int	FastPathLocalUseCount = 0;
  */
 static bool IsRelationExtensionLockHeld PG_USED_FOR_ASSERTS_ONLY = false;
 
-/*
- * Flag to indicate if the page lock is held by this backend.  We don't
- * acquire any other heavyweight lock while holding the page lock except for
- * relation extension.  However, these locks are never taken in reverse order
- * which implies that page locks will also never participate in the deadlock
- * cycle.
- *
- * Similar to relation extension, page locks are also held for a short
- * duration, so imposing such a restriction won't hurt.
- */
-static bool IsPageLockHeld PG_USED_FOR_ASSERTS_ONLY = false;
-
 /* Macros for manipulating proc->fpLockBits */
 #define FAST_PATH_BITS_PER_SLOT			3
 #define FAST_PATH_LOCKNUMBER_OFFSET		1
@@ -886,13 +874,6 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	Assert(!IsRelationExtensionLockHeld);
 
 	/*
-	 * We don't acquire any other heavyweight lock while holding the page lock
-	 * except for relation extension.
-	 */
-	Assert(!IsPageLockHeld ||
-		   (locktag->locktag_type == LOCKTAG_RELATION_EXTEND));
-
-	/*
 	 * Prepare to emit a WAL record if acquisition of this lock needs to be
 	 * replayed in a standby server.
 	 *
@@ -1340,10 +1321,10 @@ SetupLockInTable(LockMethod lockMethodTable, PGPROC *proc,
 }
 
 /*
- * Check and set/reset the flag that we hold the relation extension/page lock.
+ * Check and set/reset the flag that we hold the relation extension lock.
  *
  * It is callers responsibility that this function is called after
- * acquiring/releasing the relation extension/page lock.
+ * acquiring/releasing the relation extension lock.
  *
  * Pass acquired as true if lock is acquired, false otherwise.
  */
@@ -1353,9 +1334,6 @@ CheckAndSetLockHeld(LOCALLOCK *locallock, bool acquired)
 #ifdef USE_ASSERT_CHECKING
 	if (LOCALLOCK_LOCKTAG(*locallock) == LOCKTAG_RELATION_EXTEND)
 		IsRelationExtensionLockHeld = acquired;
-	else if (LOCALLOCK_LOCKTAG(*locallock) == LOCKTAG_PAGE)
-		IsPageLockHeld = acquired;
-
 #endif
 }
 
@@ -1481,11 +1459,9 @@ LockCheckConflicts(LockMethod lockMethodTable,
 	}
 
 	/*
-	 * The relation extension or page lock conflict even between the group
-	 * members.
+	 * The relation extension lock conflict even between the group members.
 	 */
-	if (LOCK_LOCKTAG(*lock) == LOCKTAG_RELATION_EXTEND ||
-		(LOCK_LOCKTAG(*lock) == LOCKTAG_PAGE))
+	if (LOCK_LOCKTAG(*lock) == LOCKTAG_RELATION_EXTEND)
 	{
 		PROCLOCK_PRINT("LockCheckConflicts: conflicting (group)",
 					   proclock);
@@ -2899,8 +2875,12 @@ FastPathGetRelationLockEntry(LOCALLOCK *locallock)
  * The result array is palloc'd and is terminated with an invalid VXID.
  * *countp, if not null, is updated to the number of items set.
  *
- * Of course, the result could be out of date by the time it's returned,
- * so use of this function has to be thought about carefully.
+ * Of course, the result could be out of date by the time it's returned, so
+ * use of this function has to be thought about carefully.  Similarly, a
+ * PGPROC with no "lxid" will be considered non-conflicting regardless of any
+ * lock it holds.  Existing callers don't care about a locker after that
+ * locker's pg_xact updates complete.  CommitTransaction() clears "lxid" after
+ * pg_xact updates and before releasing locks.
  *
  * Note we never include the current xact's vxid in the result array,
  * since an xact never blocks itself.
@@ -4529,36 +4509,79 @@ VirtualXactLockTableCleanup(void)
 }
 
 /*
+ *		XactLockForVirtualXact
+ *
+ * If TransactionIdIsValid(xid), this is essentially XactLockTableWait(xid,
+ * NULL, NULL, XLTW_None) or ConditionalXactLockTableWait(xid).  Unlike those
+ * functions, it assumes "xid" is never a subtransaction and that "xid" is
+ * prepared, committed, or aborted.
+ *
+ * If !TransactionIdIsValid(xid), this locks every prepared XID having been
+ * known as "vxid" before its PREPARE TRANSACTION.
+ */
+static bool
+XactLockForVirtualXact(VirtualTransactionId vxid,
+					   TransactionId xid, bool wait)
+{
+	bool		more = false;
+
+	/* There is no point to wait for 2PCs if you have no 2PCs. */
+	if (max_prepared_xacts == 0)
+		return true;
+
+	do
+	{
+		LockAcquireResult lar;
+		LOCKTAG		tag;
+
+		/* Clear state from previous iterations. */
+		if (more)
+		{
+			xid = InvalidTransactionId;
+			more = false;
+		}
+
+		/* If we have no xid, try to find one. */
+		if (!TransactionIdIsValid(xid))
+			xid = TwoPhaseGetXidByVirtualXID(vxid, &more);
+		if (!TransactionIdIsValid(xid))
+		{
+			Assert(!more);
+			return true;
+		}
+
+		/* Check or wait for XID completion. */
+		SET_LOCKTAG_TRANSACTION(tag, xid);
+		lar = LockAcquire(&tag, ShareLock, false, !wait);
+		if (lar == LOCKACQUIRE_NOT_AVAIL)
+			return false;
+		LockRelease(&tag, ShareLock, false);
+	} while (more);
+
+	return true;
+}
+
+/*
  *		VirtualXactLock
  *
- * If wait = true, wait until the given VXID has been released, and then
- * return true.
+ * If wait = true, wait as long as the given VXID or any XID acquired by the
+ * same transaction is still running.  Then, return true.
  *
- * If wait = false, just check whether the VXID is still running, and return
- * true or false.
+ * If wait = false, just check whether that VXID or one of those XIDs is still
+ * running, and return true or false.
  */
 bool
 VirtualXactLock(VirtualTransactionId vxid, bool wait)
 {
 	LOCKTAG		tag;
 	PGPROC	   *proc;
+	TransactionId xid = InvalidTransactionId;
 
 	Assert(VirtualTransactionIdIsValid(vxid));
 
-	if (VirtualTransactionIdIsPreparedXact(vxid))
-	{
-		LockAcquireResult lar;
-
-		/*
-		 * Prepared transactions don't hold vxid locks.  The
-		 * LocalTransactionId is always a normal, locked XID.
-		 */
-		SET_LOCKTAG_TRANSACTION(tag, vxid.localTransactionId);
-		lar = LockAcquire(&tag, ShareLock, false, !wait);
-		if (lar != LOCKACQUIRE_NOT_AVAIL)
-			LockRelease(&tag, ShareLock, false);
-		return lar != LOCKACQUIRE_NOT_AVAIL;
-	}
+	if (VirtualTransactionIdIsRecoveredPreparedXact(vxid))
+		/* no vxid lock; localTransactionId is a normal, locked XID */
+		return XactLockForVirtualXact(vxid, vxid.localTransactionId, wait);
 
 	SET_LOCKTAG_VIRTUALTRANSACTION(tag, vxid);
 
@@ -4572,7 +4595,7 @@ VirtualXactLock(VirtualTransactionId vxid, bool wait)
 	 */
 	proc = BackendIdGetProc(vxid.backendId);
 	if (proc == NULL)
-		return true;
+		return XactLockForVirtualXact(vxid, InvalidTransactionId, wait);
 
 	/*
 	 * We must acquire this lock before checking the backendId and lxid
@@ -4581,12 +4604,12 @@ VirtualXactLock(VirtualTransactionId vxid, bool wait)
 	 */
 	LWLockAcquire(&proc->fpInfoLock, LW_EXCLUSIVE);
 
-	/* If the transaction has ended, our work here is done. */
 	if (proc->backendId != vxid.backendId
 		|| proc->fpLocalTransactionId != vxid.localTransactionId)
 	{
+		/* VXID ended */
 		LWLockRelease(&proc->fpInfoLock);
-		return true;
+		return XactLockForVirtualXact(vxid, InvalidTransactionId, wait);
 	}
 
 	/*
@@ -4633,6 +4656,16 @@ VirtualXactLock(VirtualTransactionId vxid, bool wait)
 		proc->fpVXIDLock = false;
 	}
 
+	/*
+	 * If the proc has an XID now, we'll avoid a TwoPhaseGetXidByVirtualXID()
+	 * search.  The proc might have assigned this XID but not yet locked it,
+	 * in which case the proc will lock this XID before releasing the VXID.
+	 * The fpInfoLock critical section excludes VirtualXactLockTableCleanup(),
+	 * so we won't save an XID of a different VXID.  It doesn't matter whether
+	 * we save this before or after setting up the primary lock table entry.
+	 */
+	xid = proc->xid;
+
 	/* Done with proc->fpLockBits */
 	LWLockRelease(&proc->fpInfoLock);
 
@@ -4640,7 +4673,7 @@ VirtualXactLock(VirtualTransactionId vxid, bool wait)
 	(void) LockAcquire(&tag, ShareLock, false, false);
 
 	LockRelease(&tag, ShareLock, false);
-	return true;
+	return XactLockForVirtualXact(vxid, xid, wait);
 }
 
 /*

@@ -293,12 +293,18 @@ static const struct dropmsgstrings dropmsgstringarray[] = {
 	{'\0', 0, NULL, NULL, NULL, NULL}
 };
 
+/* communication between RemoveRelations and RangeVarCallbackForDropRelation */
 struct DropRelationCallbackState
 {
-	char		relkind;
+	/* These fields are set by RemoveRelations: */
+	char		expected_relkind;
+	LOCKMODE	heap_lockmode;
+	/* These fields are state to track which subsidiary locks are held: */
 	Oid			heapOid;
 	Oid			partParentOid;
-	bool		concurrent;
+	/* These fields are passed back by RangeVarCallbackForDropRelation: */
+	char		actual_relkind;
+	char		actual_relpersistence;
 };
 
 /* Alter table target-type flags for ATSimplePermissions */
@@ -547,7 +553,8 @@ static void ATExecSetRelOptions(Relation rel, List *defList,
 								AlterTableType operation,
 								LOCKMODE lockmode);
 static void ATExecEnableDisableTrigger(Relation rel, const char *trigname,
-									   char fires_when, bool skip_system, LOCKMODE lockmode);
+									   char fires_when, bool skip_system, bool recurse,
+									   LOCKMODE lockmode);
 static void ATExecEnableDisableRule(Relation rel, const char *rulename,
 									char fires_when, LOCKMODE lockmode);
 static void ATPrepAddInherit(Relation child_rel);
@@ -1394,10 +1401,13 @@ RemoveRelations(DropStmt *drop)
 		AcceptInvalidationMessages();
 
 		/* Look up the appropriate relation using namespace search. */
-		state.relkind = relkind;
+		state.expected_relkind = relkind;
+		state.heap_lockmode = drop->concurrent ?
+			ShareUpdateExclusiveLock : AccessExclusiveLock;
+		/* We must initialize these fields to show that no locks are held: */
 		state.heapOid = InvalidOid;
 		state.partParentOid = InvalidOid;
-		state.concurrent = drop->concurrent;
+
 		relOid = RangeVarGetRelidExtended(rel, lockmode, RVR_MISSING_OK,
 										  RangeVarCallbackForDropRelation,
 										  (void *) &state);
@@ -1411,10 +1421,10 @@ RemoveRelations(DropStmt *drop)
 
 		/*
 		 * Decide if concurrent mode needs to be used here or not.  The
-		 * relation persistence cannot be known without its OID.
+		 * callback retrieved the rel's persistence for us.
 		 */
 		if (drop->concurrent &&
-			get_rel_persistence(relOid) != RELPERSISTENCE_TEMP)
+			state.actual_relpersistence != RELPERSISTENCE_TEMP)
 		{
 			Assert(list_length(drop->objects) == 1 &&
 				   drop->removeType == OBJECT_INDEX);
@@ -1426,11 +1436,23 @@ RemoveRelations(DropStmt *drop)
 		 * either.
 		 */
 		if ((flags & PERFORM_DELETION_CONCURRENTLY) != 0 &&
-			get_rel_relkind(relOid) == RELKIND_PARTITIONED_INDEX)
+			state.actual_relkind == RELKIND_PARTITIONED_INDEX)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cannot drop partitioned index \"%s\" concurrently",
 							rel->relname)));
+
+		/*
+		 * If we're told to drop a partitioned index, we must acquire lock on
+		 * all the children of its parent partitioned table before proceeding.
+		 * Otherwise we'd try to lock the child index partitions before their
+		 * tables, leading to potential deadlock against other sessions that
+		 * will lock those objects in the other order.
+		 */
+		if (state.actual_relkind == RELKIND_PARTITIONED_INDEX)
+			(void) find_all_inheritors(state.heapOid,
+									   state.heap_lockmode,
+									   NULL);
 
 		/* OK, we're ready to delete this one */
 		obj.classId = RelationRelationId;
@@ -1457,7 +1479,6 @@ RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid, Oid oldRelOid,
 {
 	HeapTuple	tuple;
 	struct DropRelationCallbackState *state;
-	char		relkind;
 	char		expected_relkind;
 	bool		is_partition;
 	Form_pg_class classform;
@@ -1465,9 +1486,7 @@ RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid, Oid oldRelOid,
 	bool		invalid_system_index = false;
 
 	state = (struct DropRelationCallbackState *) arg;
-	relkind = state->relkind;
-	heap_lockmode = state->concurrent ?
-		ShareUpdateExclusiveLock : AccessExclusiveLock;
+	heap_lockmode = state->heap_lockmode;
 
 	/*
 	 * If we previously locked some other index's heap, and the name we're
@@ -1501,6 +1520,10 @@ RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid, Oid oldRelOid,
 	classform = (Form_pg_class) GETSTRUCT(tuple);
 	is_partition = classform->relispartition;
 
+	/* Pass back some data to save lookups in RemoveRelations */
+	state->actual_relkind = classform->relkind;
+	state->actual_relpersistence = classform->relpersistence;
+
 	/*
 	 * Both RELKIND_RELATION and RELKIND_PARTITIONED_TABLE are OBJECT_TABLE,
 	 * but RemoveRelations() can only pass one relkind for a given relation.
@@ -1516,13 +1539,15 @@ RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid, Oid oldRelOid,
 	else
 		expected_relkind = classform->relkind;
 
-	if (relkind != expected_relkind)
-		DropErrorMsgWrongType(rel->relname, classform->relkind, relkind);
+	if (state->expected_relkind != expected_relkind)
+		DropErrorMsgWrongType(rel->relname, classform->relkind,
+							  state->expected_relkind);
 
 	/* Allow DROP to either table owner or schema owner */
 	if (!pg_class_ownercheck(relOid, GetUserId()) &&
 		!pg_namespace_ownercheck(classform->relnamespace, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relOid)),
+		aclcheck_error(ACLCHECK_NOT_OWNER,
+					   get_relkind_objtype(classform->relkind),
 					   rel->relname);
 
 	/*
@@ -1531,7 +1556,7 @@ RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid, Oid oldRelOid,
 	 * only concerns indexes of toast relations that became invalid during a
 	 * REINDEX CONCURRENTLY process.
 	 */
-	if (IsSystemClass(relOid, classform) && relkind == RELKIND_INDEX)
+	if (IsSystemClass(relOid, classform) && classform->relkind == RELKIND_INDEX)
 	{
 		HeapTuple	locTuple;
 		Form_pg_index indexform;
@@ -1567,9 +1592,10 @@ RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid, Oid oldRelOid,
 	 * locking the index.  index_drop() will need this anyway, and since
 	 * regular queries lock tables before their indexes, we risk deadlock if
 	 * we do it the other way around.  No error if we don't find a pg_index
-	 * entry, though --- the relation may have been dropped.
+	 * entry, though --- the relation may have been dropped.  Note that this
+	 * code will execute for either plain or partitioned indexes.
 	 */
-	if ((relkind == RELKIND_INDEX || relkind == RELKIND_PARTITIONED_INDEX) &&
+	if (expected_relkind == RELKIND_INDEX &&
 		relOid != oldRelOid)
 	{
 		state->heapOid = IndexGetRelation(relOid, true);
@@ -1580,7 +1606,7 @@ RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid, Oid oldRelOid,
 	/*
 	 * Similarly, if the relation is a partition, we must acquire lock on its
 	 * parent before locking the partition.  That's because queries lock the
-	 * parent before its partitions, so we risk deadlock it we do it the other
+	 * parent before its partitions, so we risk deadlock if we do it the other
 	 * way around.
 	 */
 	if (is_partition && relOid != oldRelOid)
@@ -3733,7 +3759,7 @@ RenameConstraint(RenameStmt *stmt)
 ObjectAddress
 RenameRelation(RenameStmt *stmt)
 {
-	bool		is_index = stmt->renameType == OBJECT_INDEX;
+	bool		is_index_stmt = stmt->renameType == OBJECT_INDEX;
 	Oid			relid;
 	ObjectAddress address;
 
@@ -3743,24 +3769,48 @@ RenameRelation(RenameStmt *stmt)
 	 * end of transaction.
 	 *
 	 * Lock level used here should match RenameRelationInternal, to avoid lock
-	 * escalation.
+	 * escalation.  However, because ALTER INDEX can be used with any relation
+	 * type, we mustn't believe without verification.
 	 */
-	relid = RangeVarGetRelidExtended(stmt->relation,
-									 is_index ? ShareUpdateExclusiveLock : AccessExclusiveLock,
-									 stmt->missing_ok ? RVR_MISSING_OK : 0,
-									 RangeVarCallbackForAlterRelation,
-									 (void *) stmt);
-
-	if (!OidIsValid(relid))
+	for (;;)
 	{
-		ereport(NOTICE,
-				(errmsg("relation \"%s\" does not exist, skipping",
-						stmt->relation->relname)));
-		return InvalidObjectAddress;
+		LOCKMODE	lockmode;
+		char		relkind;
+		bool		obj_is_index;
+
+		lockmode = is_index_stmt ? ShareUpdateExclusiveLock : AccessExclusiveLock;
+
+		relid = RangeVarGetRelidExtended(stmt->relation, lockmode,
+										 stmt->missing_ok ? RVR_MISSING_OK : 0,
+										 RangeVarCallbackForAlterRelation,
+										 (void *) stmt);
+
+		if (!OidIsValid(relid))
+		{
+			ereport(NOTICE,
+					(errmsg("relation \"%s\" does not exist, skipping",
+							stmt->relation->relname)));
+			return InvalidObjectAddress;
+		}
+
+		/*
+		 * We allow mismatched statement and object types (e.g., ALTER INDEX
+		 * to rename a table), but we might've used the wrong lock level.  If
+		 * that happens, retry with the correct lock level.  We don't bother
+		 * if we already acquired AccessExclusiveLock with an index, however.
+		 */
+		relkind = get_rel_relkind(relid);
+		obj_is_index = (relkind == RELKIND_INDEX ||
+						relkind == RELKIND_PARTITIONED_INDEX);
+		if (obj_is_index || is_index_stmt == obj_is_index)
+			break;
+
+		UnlockRelationOid(relid, lockmode);
+		is_index_stmt = obj_is_index;
 	}
 
 	/* Do the work */
-	RenameRelationInternal(relid, stmt->newname, false, is_index);
+	RenameRelationInternal(relid, stmt->newname, false, is_index_stmt);
 
 	ObjectAddressSet(address, RelationRelationId, relid);
 
@@ -3807,6 +3857,16 @@ RenameRelationInternal(Oid myrelid, const char *newrelname, bool is_internal, bo
 				(errcode(ERRCODE_DUPLICATE_TABLE),
 				 errmsg("relation \"%s\" already exists",
 						newrelname)));
+
+	/*
+	 * RenameRelation is careful not to believe the caller's idea of the
+	 * relation kind being handled.  We don't have to worry about this, but
+	 * let's not be totally oblivious to it.  We can process an index as
+	 * not-an-index, but not the other way around.
+	 */
+	Assert(!is_index ||
+		   is_index == (targetrelation->rd_rel->relkind == RELKIND_INDEX ||
+						targetrelation->rd_rel->relkind == RELKIND_PARTITIONED_INDEX));
 
 	/*
 	 * Update pg_class tuple with new relname.  (Scribbling on reltup is OK
@@ -3962,15 +4022,19 @@ AlterTableLookupRelation(AlterTableStmt *stmt, LOCKMODE lockmode)
  * be done in this phase.  Generally, this phase acquires table locks,
  * checks permissions and relkind, and recurses to find child tables.
  *
- * ATRewriteCatalogs performs phase 2 for each affected table.  (Note that
- * phases 2 and 3 normally do no explicit recursion, since phase 1 already
- * did it --- although some subcommands have to recurse in phase 2 instead.)
+ * ATRewriteCatalogs performs phase 2 for each affected table.
  * Certain subcommands need to be performed before others to avoid
  * unnecessary conflicts; for example, DROP COLUMN should come before
  * ADD COLUMN.  Therefore phase 1 divides the subcommands into multiple
  * lists, one for each logical "pass" of phase 2.
  *
  * ATRewriteTables performs phase 3 for those tables that need it.
+ *
+ * For most subcommand types, phases 2 and 3 do no explicit recursion,
+ * since phase 1 already does it.  However, for certain subcommand types
+ * it is only possible to determine how to recurse at phase 2 time; for
+ * those cases, phase 1 sets the cmd->recurse flag (or, in some older coding,
+ * changes the command subtype of a "Recurse" variant XXX to be cleaned up.)
  *
  * Thanks to the magic of MVCC, an error anywhere along the way rolls back
  * the whole operation; we don't have to do anything special to clean up.
@@ -4391,10 +4455,10 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 				errhint("Use ALTER TABLE ... DETACH PARTITION ... FINALIZE to complete the pending detach operation."));
 
 	/*
-	 * Copy the original subcommand for each table.  This avoids conflicts
-	 * when different child tables need to make different parse
-	 * transformations (for example, the same column may have different column
-	 * numbers in different children).
+	 * Copy the original subcommand for each table, so we can scribble on it.
+	 * This avoids conflicts when different child tables need to make
+	 * different parse transformations (for example, the same column may have
+	 * different column numbers in different children).
 	 */
 	cmd = copyObject(cmd);
 
@@ -4491,7 +4555,7 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 			break;
 		case AT_SetOptions:		/* ALTER COLUMN SET ( options ) */
 		case AT_ResetOptions:	/* ALTER COLUMN RESET ( options ) */
-			ATSimplePermissions(rel, ATT_TABLE | ATT_MATVIEW | ATT_INDEX | ATT_FOREIGN_TABLE);
+			ATSimplePermissions(rel, ATT_TABLE | ATT_MATVIEW | ATT_FOREIGN_TABLE);
 			/* This command never recurses */
 			pass = AT_PASS_MISC;
 			break;
@@ -4663,8 +4727,9 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 		case AT_DisableTrigAll:
 		case AT_DisableTrigUser:
 			ATSimplePermissions(rel, ATT_TABLE | ATT_FOREIGN_TABLE);
-			if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
-				ATSimpleRecursion(wqueue, rel, cmd, recurse, lockmode, context);
+			/* Set up recursion for phase 2; no other prep needed */
+			if (recurse)
+				cmd->recurse = true;
 			pass = AT_PASS_MISC;
 			break;
 		case AT_EnableRule:		/* ENABLE/DISABLE RULE variants */
@@ -5002,35 +5067,51 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab,
 			break;
 		case AT_EnableTrig:		/* ENABLE TRIGGER name */
 			ATExecEnableDisableTrigger(rel, cmd->name,
-									   TRIGGER_FIRES_ON_ORIGIN, false, lockmode);
+									   TRIGGER_FIRES_ON_ORIGIN, false,
+									   cmd->recurse,
+									   lockmode);
 			break;
 		case AT_EnableAlwaysTrig:	/* ENABLE ALWAYS TRIGGER name */
 			ATExecEnableDisableTrigger(rel, cmd->name,
-									   TRIGGER_FIRES_ALWAYS, false, lockmode);
+									   TRIGGER_FIRES_ALWAYS, false,
+									   cmd->recurse,
+									   lockmode);
 			break;
 		case AT_EnableReplicaTrig:	/* ENABLE REPLICA TRIGGER name */
 			ATExecEnableDisableTrigger(rel, cmd->name,
-									   TRIGGER_FIRES_ON_REPLICA, false, lockmode);
+									   TRIGGER_FIRES_ON_REPLICA, false,
+									   cmd->recurse,
+									   lockmode);
 			break;
 		case AT_DisableTrig:	/* DISABLE TRIGGER name */
 			ATExecEnableDisableTrigger(rel, cmd->name,
-									   TRIGGER_DISABLED, false, lockmode);
+									   TRIGGER_DISABLED, false,
+									   cmd->recurse,
+									   lockmode);
 			break;
 		case AT_EnableTrigAll:	/* ENABLE TRIGGER ALL */
 			ATExecEnableDisableTrigger(rel, NULL,
-									   TRIGGER_FIRES_ON_ORIGIN, false, lockmode);
+									   TRIGGER_FIRES_ON_ORIGIN, false,
+									   cmd->recurse,
+									   lockmode);
 			break;
 		case AT_DisableTrigAll: /* DISABLE TRIGGER ALL */
 			ATExecEnableDisableTrigger(rel, NULL,
-									   TRIGGER_DISABLED, false, lockmode);
+									   TRIGGER_DISABLED, false,
+									   cmd->recurse,
+									   lockmode);
 			break;
 		case AT_EnableTrigUser: /* ENABLE TRIGGER USER */
 			ATExecEnableDisableTrigger(rel, NULL,
-									   TRIGGER_FIRES_ON_ORIGIN, true, lockmode);
+									   TRIGGER_FIRES_ON_ORIGIN, true,
+									   cmd->recurse,
+									   lockmode);
 			break;
 		case AT_DisableTrigUser:	/* DISABLE TRIGGER USER */
 			ATExecEnableDisableTrigger(rel, NULL,
-									   TRIGGER_DISABLED, true, lockmode);
+									   TRIGGER_DISABLED, true,
+									   cmd->recurse,
+									   lockmode);
 			break;
 
 		case AT_EnableRule:		/* ENABLE RULE name */
@@ -6215,6 +6296,7 @@ find_composite_type_dependencies(Oid typeOid, Relation origRelation,
 	{
 		Form_pg_depend pg_depend = (Form_pg_depend) GETSTRUCT(depTup);
 		Relation	rel;
+		TupleDesc	tupleDesc;
 		Form_pg_attribute att;
 
 		/* Check for directly dependent types */
@@ -6231,18 +6313,58 @@ find_composite_type_dependencies(Oid typeOid, Relation origRelation,
 			continue;
 		}
 
-		/* Else, ignore dependees that aren't user columns of relations */
-		/* (we assume system columns are never of interesting types) */
-		if (pg_depend->classid != RelationRelationId ||
-			pg_depend->objsubid <= 0)
+		/* Else, ignore dependees that aren't relations */
+		if (pg_depend->classid != RelationRelationId)
 			continue;
 
 		rel = relation_open(pg_depend->objid, AccessShareLock);
-		att = TupleDescAttr(rel->rd_att, pg_depend->objsubid - 1);
+		tupleDesc = RelationGetDescr(rel);
 
-		if (rel->rd_rel->relkind == RELKIND_RELATION ||
-			rel->rd_rel->relkind == RELKIND_MATVIEW ||
-			rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		/*
+		 * If objsubid identifies a specific column, refer to that in error
+		 * messages.  Otherwise, search to see if there's a user column of the
+		 * type.  (We assume system columns are never of interesting types.)
+		 * The search is needed because an index containing an expression
+		 * column of the target type will just be recorded as a whole-relation
+		 * dependency.  If we do not find a column of the type, the dependency
+		 * must indicate that the type is transiently referenced in an index
+		 * expression but not stored on disk, which we assume is OK, just as
+		 * we do for references in views.  (It could also be that the target
+		 * type is embedded in some container type that is stored in an index
+		 * column, but the previous recursion should catch such cases.)
+		 */
+		if (pg_depend->objsubid > 0 && pg_depend->objsubid <= tupleDesc->natts)
+			att = TupleDescAttr(tupleDesc, pg_depend->objsubid - 1);
+		else
+		{
+			att = NULL;
+			for (int attno = 1; attno <= tupleDesc->natts; attno++)
+			{
+				att = TupleDescAttr(tupleDesc, attno - 1);
+				if (att->atttypid == typeOid && !att->attisdropped)
+					break;
+				att = NULL;
+			}
+			if (att == NULL)
+			{
+				/* No such column, so assume OK */
+				relation_close(rel, AccessShareLock);
+				continue;
+			}
+		}
+
+		/*
+		 * We definitely should reject if the relation has storage.  If it's
+		 * partitioned, then perhaps we don't have to reject: if there are
+		 * partitions then we'll fail when we find one, else there is no
+		 * stored data to worry about.  However, it's possible that the type
+		 * change would affect conclusions about whether the type is sortable
+		 * or hashable and thus (if it's a partitioning column) break the
+		 * partitioning rule.  For now, reject for partitioned rels too.
+		 */
+		if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind) ||
+			rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+			rel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX)
 		{
 			if (origTypeName)
 				ereport(ERROR,
@@ -6505,6 +6627,10 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 							colDef->colname, RelationGetRelationName(rel))));
 
 			table_close(attrdesc, RowExclusiveLock);
+
+			/* Make the child column change visible */
+			CommandCounterIncrement();
+
 			return InvalidObjectAddress;
 		}
 	}
@@ -6986,7 +7112,8 @@ ATExecDropNotNull(Relation rel, const char *colName, LOCKMODE lockmode)
 						colName, RelationGetRelationName(rel))));
 
 	/*
-	 * Check that the attribute is not in a primary key
+	 * Check that the attribute is not in a primary key or in an index used as
+	 * a replica identity.
 	 *
 	 * Note: we'll throw error even if the pkey index is not valid.
 	 */
@@ -7006,20 +7133,32 @@ ATExecDropNotNull(Relation rel, const char *colName, LOCKMODE lockmode)
 			elog(ERROR, "cache lookup failed for index %u", indexoid);
 		indexStruct = (Form_pg_index) GETSTRUCT(indexTuple);
 
-		/* If the index is not a primary key, skip the check */
-		if (indexStruct->indisprimary)
+		/*
+		 * If the index is not a primary key or an index used as replica
+		 * identity, skip the check.
+		 */
+		if (indexStruct->indisprimary || indexStruct->indisreplident)
 		{
 			/*
-			 * Loop over each attribute in the primary key and see if it
-			 * matches the to-be-altered attribute
+			 * Loop over each attribute in the primary key or the index used
+			 * as replica identity and see if it matches the to-be-altered
+			 * attribute.
 			 */
 			for (i = 0; i < indexStruct->indnkeyatts; i++)
 			{
 				if (indexStruct->indkey.values[i] == attnum)
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-							 errmsg("column \"%s\" is in a primary key",
-									colName)));
+				{
+					if (indexStruct->indisprimary)
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+								 errmsg("column \"%s\" is in a primary key",
+										colName)));
+					else
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+								 errmsg("column \"%s\" is in index used as replica identity",
+										colName)));
+				}
 			}
 		}
 
@@ -9655,6 +9794,8 @@ CloneForeignKeyConstraints(List **wqueue, Relation parentRel,
  * clone those constraints to the given partition.  This is to be called
  * when the partition is being created or attached.
  *
+ * This ignores self-referencing FKs; those are handled by CloneFkReferencing.
+ *
  * This recurses to partitions, if the relation being attached is partitioned.
  * Recursion is done by calling addFkRecurseReferenced.
  */
@@ -9731,6 +9872,17 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 		}
 
 		/*
+		 * Don't clone self-referencing foreign keys, which can be in the
+		 * partitioned table or in the partition-to-be.
+		 */
+		if (constrForm->conrelid == RelationGetRelid(parentRel) ||
+			constrForm->conrelid == RelationGetRelid(partitionRel))
+		{
+			ReleaseSysCache(tuple);
+			continue;
+		}
+
+		/*
 		 * Because we're only expanding the key space at the referenced side,
 		 * we don't need to prevent any operation in the referencing table, so
 		 * AccessShareLock suffices (assumes that dropping the constraint
@@ -9751,14 +9903,21 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 			mapped_confkey[i] = attmap->attnums[confkey[i] - 1];
 
 		fkconstraint = makeNode(Constraint);
-		/* for now this is all we need */
+		fkconstraint->contype = CONSTRAINT_FOREIGN;
 		fkconstraint->conname = NameStr(constrForm->conname);
-		fkconstraint->fk_upd_action = constrForm->confupdtype;
-		fkconstraint->fk_del_action = constrForm->confdeltype;
 		fkconstraint->deferrable = constrForm->condeferrable;
 		fkconstraint->initdeferred = constrForm->condeferred;
-		fkconstraint->initially_valid = true;
+		fkconstraint->location = -1;
+		fkconstraint->pktable = NULL;
+		/* ->fk_attrs determined below */
+		fkconstraint->pk_attrs = NIL;
 		fkconstraint->fk_matchtype = constrForm->confmatchtype;
+		fkconstraint->fk_upd_action = constrForm->confupdtype;
+		fkconstraint->fk_del_action = constrForm->confdeltype;
+		fkconstraint->old_conpfeqop = NIL;
+		fkconstraint->old_pktable_oid = InvalidOid;
+		fkconstraint->skip_validation = false;
+		fkconstraint->initially_valid = true;
 
 		/* set up colnames that are used to generate the constraint name */
 		for (int i = 0; i < numfks; i++)
@@ -9930,6 +10089,30 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 
 		/* No dice.  Set up to create our own constraint */
 		fkconstraint = makeNode(Constraint);
+		fkconstraint->contype = CONSTRAINT_FOREIGN;
+		/* ->conname determined below */
+		fkconstraint->deferrable = constrForm->condeferrable;
+		fkconstraint->initdeferred = constrForm->condeferred;
+		fkconstraint->location = -1;
+		fkconstraint->pktable = NULL;
+		/* ->fk_attrs determined below */
+		fkconstraint->pk_attrs = NIL;
+		fkconstraint->fk_matchtype = constrForm->confmatchtype;
+		fkconstraint->fk_upd_action = constrForm->confupdtype;
+		fkconstraint->fk_del_action = constrForm->confdeltype;
+		fkconstraint->old_conpfeqop = NIL;
+		fkconstraint->old_pktable_oid = InvalidOid;
+		fkconstraint->skip_validation = false;
+		fkconstraint->initially_valid = true;
+		for (int i = 0; i < numfks; i++)
+		{
+			Form_pg_attribute att;
+
+			att = TupleDescAttr(RelationGetDescr(partRel),
+								mapped_conkey[i] - 1);
+			fkconstraint->fk_attrs = lappend(fkconstraint->fk_attrs,
+											 makeString(NameStr(att->attname)));
+		}
 		if (ConstraintNameIsUsed(CONSTRAINT_RELATION,
 								 RelationGetRelid(partRel),
 								 NameStr(constrForm->conname)))
@@ -9940,20 +10123,6 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 									 RelationGetNamespace(partRel), NIL);
 		else
 			fkconstraint->conname = pstrdup(NameStr(constrForm->conname));
-		fkconstraint->fk_upd_action = constrForm->confupdtype;
-		fkconstraint->fk_del_action = constrForm->confdeltype;
-		fkconstraint->deferrable = constrForm->condeferrable;
-		fkconstraint->initdeferred = constrForm->condeferred;
-		fkconstraint->fk_matchtype = constrForm->confmatchtype;
-		for (int i = 0; i < numfks; i++)
-		{
-			Form_pg_attribute att;
-
-			att = TupleDescAttr(RelationGetDescr(partRel),
-								mapped_conkey[i] - 1);
-			fkconstraint->fk_attrs = lappend(fkconstraint->fk_attrs,
-											 makeString(NameStr(att->attname)));
-		}
 
 		indexOid = constrForm->conindid;
 		constrOid =
@@ -10635,6 +10804,11 @@ ATExecValidateConstraint(List **wqueue, Relation rel, char *constrName,
  * transformColumnNameList - transform list of column names
  *
  * Lookup each name and return its attnum and type OID
+ *
+ * Note: the name of this function suggests that it's general-purpose,
+ * but actually it's only used to look up names appearing in foreign-key
+ * clauses.  The error messages would need work to use it in other cases,
+ * and perhaps the validity checks as well.
  */
 static int
 transformColumnNameList(Oid relId, List *colList,
@@ -10648,6 +10822,7 @@ transformColumnNameList(Oid relId, List *colList,
 	{
 		char	   *attname = strVal(lfirst(l));
 		HeapTuple	atttuple;
+		Form_pg_attribute attform;
 
 		atttuple = SearchSysCacheAttName(relId, attname);
 		if (!HeapTupleIsValid(atttuple))
@@ -10655,13 +10830,18 @@ transformColumnNameList(Oid relId, List *colList,
 					(errcode(ERRCODE_UNDEFINED_COLUMN),
 					 errmsg("column \"%s\" referenced in foreign key constraint does not exist",
 							attname)));
+		attform = (Form_pg_attribute) GETSTRUCT(atttuple);
+		if (attform->attnum < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("system columns cannot be used in foreign keys")));
 		if (attnum >= INDEX_MAX_KEYS)
 			ereport(ERROR,
 					(errcode(ERRCODE_TOO_MANY_COLUMNS),
 					 errmsg("cannot have more than %d keys in a foreign key",
 							INDEX_MAX_KEYS)));
-		attnums[attnum] = ((Form_pg_attribute) GETSTRUCT(atttuple))->attnum;
-		atttypids[attnum] = ((Form_pg_attribute) GETSTRUCT(atttuple))->atttypid;
+		attnums[attnum] = attform->attnum;
+		atttypids[attnum] = attform->atttypid;
 		ReleaseSysCache(atttuple);
 		attnum++;
 	}
@@ -10773,15 +10953,19 @@ transformFkeyGetPrimaryKey(Relation pkrel, Oid *indexOid,
 /*
  * transformFkeyCheckAttrs -
  *
- *	Make sure that the attributes of a referenced table belong to a unique
- *	(or primary key) constraint.  Return the OID of the index supporting
- *	the constraint, as well as the opclasses associated with the index
- *	columns.
+ *	Validate that the 'attnums' columns in the 'pkrel' relation are valid to
+ *	reference as part of a foreign key constraint.
+ *
+ *	Returns the OID of the unique index supporting the constraint and
+ *	populates the caller-provided 'opclasses' array with the opclasses
+ *	associated with the index columns.
+ *
+ *	Raises an ERROR on validation failure.
  */
 static Oid
 transformFkeyCheckAttrs(Relation pkrel,
 						int numattrs, int16 *attnums,
-						Oid *opclasses) /* output parameter */
+						Oid *opclasses)
 {
 	Oid			indexoid = InvalidOid;
 	bool		found = false;
@@ -11667,12 +11851,11 @@ ATPrepAlterColumnType(List **wqueue,
 				 errmsg("\"%s\" is not a table",
 						RelationGetRelationName(rel))));
 
-	if (tab->relkind == RELKIND_COMPOSITE_TYPE ||
-		tab->relkind == RELKIND_FOREIGN_TABLE)
+	if (!RELKIND_HAS_STORAGE(tab->relkind))
 	{
 		/*
-		 * For composite types and foreign tables, do this check now.  Regular
-		 * tables will check it later when the table is being rewritten.
+		 * For relations without storage, do this check now.  Regular tables
+		 * will check it later when the table is being rewritten.
 		 */
 		find_composite_type_dependencies(rel->rd_rel->reltype, rel, NULL);
 	}
@@ -12465,13 +12648,13 @@ RememberStatisticsForRebuilding(Oid stxoid, AlteredTableInfo *tab)
 	/*
 	 * This de-duplication check is critical for two independent reasons: we
 	 * mustn't try to recreate the same statistics object twice, and if the
-	 * statistics depends on more than one column whose type is to be altered,
-	 * we must capture its definition string before applying any of the type
-	 * changes. ruleutils.c will get confused if we ask again later.
+	 * statistics object depends on more than one column whose type is to be
+	 * altered, we must capture its definition string before applying any of
+	 * the type changes. ruleutils.c will get confused if we ask again later.
 	 */
 	if (!list_member_oid(tab->changedStatisticsOids, stxoid))
 	{
-		/* OK, capture the index's existing definition string */
+		/* OK, capture the statistics object's existing definition string */
 		char	   *defstring = pg_get_statisticsobjdef_string(stxoid);
 
 		tab->changedStatisticsOids = lappend_oid(tab->changedStatisticsOids,
@@ -14051,7 +14234,6 @@ index_copy_data(Relation rel, RelFileNode newrnode)
 	SMgrRelation dstrel;
 
 	dstrel = smgropen(newrnode, rel->rd_backend);
-	RelationOpenSmgr(rel);
 
 	/*
 	 * Since we copy the file directly without looking at the shared buffers,
@@ -14071,14 +14253,14 @@ index_copy_data(Relation rel, RelFileNode newrnode)
 	RelationCreateStorage(newrnode, rel->rd_rel->relpersistence);
 
 	/* copy main fork */
-	RelationCopyStorage(rel->rd_smgr, dstrel, MAIN_FORKNUM,
+	RelationCopyStorage(RelationGetSmgr(rel), dstrel, MAIN_FORKNUM,
 						rel->rd_rel->relpersistence);
 
 	/* copy those extra forks that exist */
 	for (ForkNumber forkNum = MAIN_FORKNUM + 1;
 		 forkNum <= MAX_FORKNUM; forkNum++)
 	{
-		if (smgrexists(rel->rd_smgr, forkNum))
+		if (smgrexists(RelationGetSmgr(rel), forkNum))
 		{
 			smgrcreate(dstrel, forkNum, false);
 
@@ -14090,7 +14272,7 @@ index_copy_data(Relation rel, RelFileNode newrnode)
 				(rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED &&
 				 forkNum == INIT_FORKNUM))
 				log_smgrcreate(&newrnode, forkNum);
-			RelationCopyStorage(rel->rd_smgr, dstrel, forkNum,
+			RelationCopyStorage(RelationGetSmgr(rel), dstrel, forkNum,
 								rel->rd_rel->relpersistence);
 		}
 	}
@@ -14107,9 +14289,11 @@ index_copy_data(Relation rel, RelFileNode newrnode)
  */
 static void
 ATExecEnableDisableTrigger(Relation rel, const char *trigname,
-						   char fires_when, bool skip_system, LOCKMODE lockmode)
+						   char fires_when, bool skip_system, bool recurse,
+						   LOCKMODE lockmode)
 {
-	EnableDisableTrigger(rel, trigname, fires_when, skip_system, lockmode);
+	EnableDisableTriggerNew(rel, trigname, fires_when, skip_system, recurse,
+							lockmode);
 }
 
 /*
@@ -14740,8 +14924,6 @@ MarkInheritDetached(Relation child_rel, Relation parent_rel)
 	HeapTuple	inheritsTuple;
 	bool		found = false;
 
-	Assert(child_rel->rd_rel->relkind == RELKIND_RELATION ||
-		   child_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
 	Assert(parent_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
 
 	/*
@@ -15220,7 +15402,10 @@ ATExecDropOf(Relation rel, LOCKMODE lockmode)
  * relation_mark_replica_identity: Update a table's replica identity
  *
  * Iff ri_type = REPLICA_IDENTITY_INDEX, indexOid must be the Oid of a suitable
- * index. Otherwise, it should be InvalidOid.
+ * index. Otherwise, it must be InvalidOid.
+ *
+ * Caller had better hold an exclusive lock on the relation, as the results
+ * of running two of these concurrently wouldn't be pretty.
  */
 static void
 relation_mark_replica_identity(Relation rel, char ri_type, Oid indexOid,
@@ -15232,7 +15417,6 @@ relation_mark_replica_identity(Relation rel, char ri_type, Oid indexOid,
 	HeapTuple	pg_index_tuple;
 	Form_pg_class pg_class_form;
 	Form_pg_index pg_index_form;
-
 	ListCell   *index;
 
 	/*
@@ -15254,29 +15438,7 @@ relation_mark_replica_identity(Relation rel, char ri_type, Oid indexOid,
 	heap_freetuple(pg_class_tuple);
 
 	/*
-	 * Check whether the correct index is marked indisreplident; if so, we're
-	 * done.
-	 */
-	if (OidIsValid(indexOid))
-	{
-		Assert(ri_type == REPLICA_IDENTITY_INDEX);
-
-		pg_index_tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indexOid));
-		if (!HeapTupleIsValid(pg_index_tuple))
-			elog(ERROR, "cache lookup failed for index %u", indexOid);
-		pg_index_form = (Form_pg_index) GETSTRUCT(pg_index_tuple);
-
-		if (pg_index_form->indisreplident)
-		{
-			ReleaseSysCache(pg_index_tuple);
-			return;
-		}
-		ReleaseSysCache(pg_index_tuple);
-	}
-
-	/*
-	 * Clear the indisreplident flag from any index that had it previously,
-	 * and set it for any index that should have it now.
+	 * Update the per-index indisreplident flags correctly.
 	 */
 	pg_index = table_open(IndexRelationId, RowExclusiveLock);
 	foreach(index, RelationGetIndexList(rel))
@@ -15290,19 +15452,23 @@ relation_mark_replica_identity(Relation rel, char ri_type, Oid indexOid,
 			elog(ERROR, "cache lookup failed for index %u", thisIndexOid);
 		pg_index_form = (Form_pg_index) GETSTRUCT(pg_index_tuple);
 
-		/*
-		 * Unset the bit if set.  We know it's wrong because we checked this
-		 * earlier.
-		 */
-		if (pg_index_form->indisreplident)
+		if (thisIndexOid == indexOid)
 		{
-			dirty = true;
-			pg_index_form->indisreplident = false;
+			/* Set the bit if not already set. */
+			if (!pg_index_form->indisreplident)
+			{
+				dirty = true;
+				pg_index_form->indisreplident = true;
+			}
 		}
-		else if (thisIndexOid == indexOid)
+		else
 		{
-			dirty = true;
-			pg_index_form->indisreplident = true;
+			/* Unset the bit if set. */
+			if (pg_index_form->indisreplident)
+			{
+				dirty = true;
+				pg_index_form->indisreplident = false;
+			}
 		}
 
 		if (dirty)
@@ -15310,6 +15476,14 @@ relation_mark_replica_identity(Relation rel, char ri_type, Oid indexOid,
 			CatalogTupleUpdate(pg_index, &pg_index_tuple->t_self, pg_index_tuple);
 			InvokeObjectPostAlterHookArg(IndexRelationId, thisIndexOid, 0,
 										 InvalidOid, is_internal);
+			/*
+			 * Invalidate the relcache for the table, so that after we commit
+			 * all sessions will refresh the table's replica identity index
+			 * before attempting any UPDATE or DELETE on the table.  (If we
+			 * changed the table's pg_class row above, then a relcache inval
+			 * is already queued due to that; but we might not have.)
+			 */
+			CacheInvalidateRelcache(rel);
 		}
 		heap_freetuple(pg_index_tuple);
 	}
@@ -15392,12 +15566,6 @@ ATExecReplicaIdentity(Relation rel, ReplicaIdentityStmt *stmt, LOCKMODE lockmode
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot use partial index \"%s\" as replica identity",
-						RelationGetRelationName(indexRel))));
-	/* And neither are invalid indexes. */
-	if (!indexRel->rd_index->indisvalid)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot use invalid index \"%s\" as replica identity",
 						RelationGetRelationName(indexRel))));
 
 	/* Check index for nullable columns. */
@@ -16205,11 +16373,19 @@ PreCommit_on_commit_actions(void)
 		}
 
 		/*
+		 * Object deletion might involve toast table access (to clean up
+		 * toasted catalog entries), so ensure we have a valid snapshot.
+		 */
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		/*
 		 * Since this is an automatic drop, rather than one directly initiated
 		 * by the user, we pass the PERFORM_DELETION_INTERNAL flag.
 		 */
 		performMultipleDeletions(targetObjects, DROP_CASCADE,
 								 PERFORM_DELETION_INTERNAL | PERFORM_DELETION_QUIETLY);
+
+		PopActiveSnapshot();
 
 #ifdef USE_ASSERT_CHECKING
 
@@ -16693,30 +16869,6 @@ ComputePartitionAttrs(ParseState *pstate, Relation rel, List *partParams, AttrNu
 				*partexprs = lappend(*partexprs, expr);
 
 				/*
-				 * Try to simplify the expression before checking for
-				 * mutability.  The main practical value of doing it in this
-				 * order is that an inline-able SQL-language function will be
-				 * accepted if its expansion is immutable, whether or not the
-				 * function itself is marked immutable.
-				 *
-				 * Note that expression_planner does not change the passed in
-				 * expression destructively and we have already saved the
-				 * expression to be stored into the catalog above.
-				 */
-				expr = (Node *) expression_planner((Expr *) expr);
-
-				/*
-				 * Partition expression cannot contain mutable functions,
-				 * because a given row must always map to the same partition
-				 * as long as there is no change in the partition boundary
-				 * structure.
-				 */
-				if (contain_mutable_functions(expr))
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-							 errmsg("functions in partition key expression must be marked IMMUTABLE")));
-
-				/*
 				 * transformPartitionSpec() should have already rejected
 				 * subqueries, aggregates, window functions, and SRFs, based
 				 * on the EXPR_KIND_ for partition expressions.
@@ -16756,6 +16908,32 @@ ComputePartitionAttrs(ParseState *pstate, Relation rel, List *partParams, AttrNu
 										   get_attname(RelationGetRelid(rel), attno, false)),
 								 parser_errposition(pstate, pelem->location)));
 				}
+
+				/*
+				 * Preprocess the expression before checking for mutability.
+				 * This is essential for the reasons described in
+				 * contain_mutable_functions_after_planning.  However, we call
+				 * expression_planner for ourselves rather than using that
+				 * function, because if constant-folding reduces the
+				 * expression to a constant, we'd like to know that so we can
+				 * complain below.
+				 *
+				 * Like contain_mutable_functions_after_planning, assume that
+				 * expression_planner won't scribble on its input, so this
+				 * won't affect the partexprs entry we saved above.
+				 */
+				expr = (Node *) expression_planner((Expr *) expr);
+
+				/*
+				 * Partition expressions cannot contain mutable functions,
+				 * because a given row must always map to the same partition
+				 * as long as there is no change in the partition boundary
+				 * structure.
+				 */
+				if (contain_mutable_functions(expr))
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+							 errmsg("functions in partition key expression must be marked IMMUTABLE")));
 
 				/*
 				 * While it is not exactly *wrong* for a partition expression
@@ -17307,6 +17485,22 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd,
 
 	ObjectAddressSet(address, RelationRelationId, RelationGetRelid(attachrel));
 
+	/*
+	 * If the partition we just attached is partitioned itself, invalidate
+	 * relcache for all descendent partitions too to ensure that their
+	 * rd_partcheck expression trees are rebuilt; partitions already locked
+	 * at the beginning of this function.
+	 */
+	if (attachrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		ListCell *l;
+
+		foreach(l, attachrel_children)
+		{
+			CacheInvalidateRelcacheByRelid(lfirst_oid(l));
+		}
+	}
+
 	/* keep our lock until commit */
 	table_close(attachrel, NoLock);
 
@@ -17413,8 +17607,8 @@ AttachPartitionEnsureIndexes(Relation rel, Relation attachrel)
 
 		/*
 		 * Scan the list of existing indexes in the partition-to-be, and mark
-		 * the first matching, unattached one we find, if any, as partition of
-		 * the parent index.  If we find one, we're done.
+		 * the first matching, valid, unattached one we find, if any, as
+		 * partition of the parent index.  If we find one, we're done.
 		 */
 		for (i = 0; i < list_length(attachRelIdxs); i++)
 		{
@@ -17423,6 +17617,10 @@ AttachPartitionEnsureIndexes(Relation rel, Relation attachrel)
 
 			/* does this index have a parent?  if so, can't use it */
 			if (attachrelIdxRels[i]->rd_rel->relispartition)
+				continue;
+
+			/* If this index is invalid, can't use it */
+			if (!attachrelIdxRels[i]->rd_index->indisvalid)
 				continue;
 
 			if (CompareIndexInfo(attachInfos[i], info,
@@ -17682,9 +17880,9 @@ ATExecDetachPartition(List **wqueue, AlteredTableInfo *tab, Relation rel,
 		 * constraint would change.  And there's a definitional problem: what
 		 * should happen to the tuples that are being inserted that belong to
 		 * the partition being detached?  Putting them on the partition being
-		 * detached would be wrong, since they'd become "lost" after the but
-		 * we cannot put them in the default partition either until we alter
-		 * its partition constraint.
+		 * detached would be wrong, since they'd become "lost" after the
+		 * detaching completes but we cannot put them in the default partition
+		 * either until we alter its partition constraint.
 		 *
 		 * I think we could solve this problem if we effected the constraint
 		 * change before committing the first transaction.  But the lock would
@@ -17891,11 +18089,21 @@ DetachPartitionFinalize(Relation rel, Relation partRel, bool concurrent,
 		 * still do), but now we need separate ones of our own.
 		 */
 		fkconstraint = makeNode(Constraint);
+		fkconstraint->contype = CONSTRAINT_FOREIGN;
 		fkconstraint->conname = pstrdup(NameStr(conform->conname));
-		fkconstraint->fk_upd_action = conform->confupdtype;
-		fkconstraint->fk_del_action = conform->confdeltype;
 		fkconstraint->deferrable = conform->condeferrable;
 		fkconstraint->initdeferred = conform->condeferred;
+		fkconstraint->location = -1;
+		fkconstraint->pktable = NULL;
+		fkconstraint->fk_attrs = NIL;
+		fkconstraint->pk_attrs = NIL;
+		fkconstraint->fk_matchtype = conform->confmatchtype;
+		fkconstraint->fk_upd_action = conform->confupdtype;
+		fkconstraint->fk_del_action = conform->confdeltype;
+		fkconstraint->old_conpfeqop = NIL;
+		fkconstraint->old_pktable_oid = InvalidOid;
+		fkconstraint->skip_validation = false;
+		fkconstraint->initially_valid = true;
 
 		createForeignKeyActionTriggers(partRel, conform->confrelid,
 									   fkconstraint, fk->conoid,
@@ -17997,6 +18205,25 @@ DetachPartitionFinalize(Relation rel, Relation partRel, bool concurrent,
 	 * included in its partition descriptor.
 	 */
 	CacheInvalidateRelcache(rel);
+
+	/*
+	 * If the partition we just detached is partitioned itself, invalidate
+	 * relcache for all descendent partitions too to ensure that their
+	 * rd_partcheck expression trees are rebuilt; must lock partitions
+	 * before doing so, using the same lockmode as what partRel has been
+	 * locked with by the caller.
+	 */
+	if (partRel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		List   *children;
+
+		children = find_all_inheritors(RelationGetRelid(partRel),
+									   AccessExclusiveLock, NULL);
+		foreach(cell, children)
+		{
+			CacheInvalidateRelcacheByRelid(lfirst_oid(cell));
+		}
+	}
 }
 
 /*
@@ -18427,17 +18654,24 @@ validatePartitionedIndex(Relation partedIdx, Relation partedTbl)
 	if (tuples == RelationGetPartitionDesc(partedTbl, true)->nparts)
 	{
 		Relation	idxRel;
-		HeapTuple	newtup;
+		HeapTuple	indTup;
+		Form_pg_index indexForm;
 
 		idxRel = table_open(IndexRelationId, RowExclusiveLock);
+		indTup = SearchSysCacheCopy1(INDEXRELID,
+									 ObjectIdGetDatum(RelationGetRelid(partedIdx)));
+		if (!HeapTupleIsValid(indTup))
+			elog(ERROR, "cache lookup failed for index %u",
+				 RelationGetRelid(partedIdx));
+		indexForm = (Form_pg_index) GETSTRUCT(indTup);
 
-		newtup = heap_copytuple(partedIdx->rd_indextuple);
-		((Form_pg_index) GETSTRUCT(newtup))->indisvalid = true;
+		indexForm->indisvalid = true;
 		updated = true;
 
-		CatalogTupleUpdate(idxRel, &partedIdx->rd_indextuple->t_self, newtup);
+		CatalogTupleUpdate(idxRel, &indTup->t_self, indTup);
 
 		table_close(idxRel, RowExclusiveLock);
+		heap_freetuple(indTup);
 	}
 
 	/*

@@ -87,9 +87,6 @@
 /* Define to 1 if you have the `backtrace_symbols' function. */
 #define HAVE_BACKTRACE_SYMBOLS 1
 
-/* Define to 1 if you have the `BIO_get_data' function. */
-/* #undef HAVE_BIO_GET_DATA */
-
 /* Define to 1 if you have the `BIO_meth_new' function. */
 /* #undef HAVE_BIO_METH_NEW */
 
@@ -620,6 +617,9 @@
 /* Define to 1 if you have the <sys/ipc.h> header file. */
 #define HAVE_SYS_IPC_H 1
 
+/* Define to 1 if you have the <sys/personality.h> header file. */
+#define HAVE_SYS_PERSONALITY_H 1
+
 /* Define to 1 if you have the <sys/prctl.h> header file. */
 #define HAVE_SYS_PRCTL_H 1
 
@@ -640,6 +640,9 @@
 
 /* Define to 1 if you have the <sys/shm.h> header file. */
 #define HAVE_SYS_SHM_H 1
+
+/* Define to 1 if you have the <sys/signalfd.h> header file. */
+#define HAVE_SYS_SIGNALFD_H 1
 
 /* Define to 1 if you have the <sys/sockio.h> header file. */
 /* #undef HAVE_SYS_SOCKIO_H */
@@ -716,6 +719,9 @@
 /* Define to 1 if you have the `writev' function. */
 #define HAVE_WRITEV 1
 
+/* Define to 1 if you have the `X509_get_signature_info' function. */
+/* #undef HAVE_X509_GET_SIGNATURE_INFO */
+
 /* Define to 1 if you have the `X509_get_signature_nid' function. */
 /* #undef HAVE_X509_GET_SIGNATURE_NID */
 
@@ -742,6 +748,9 @@
 
 /* Define to 1 if your compiler understands __builtin_ctz. */
 #define HAVE__BUILTIN_CTZ 1
+
+/* Define to 1 if your compiler understands __builtin_frame_address. */
+#define HAVE__BUILTIN_FRAME_ADDRESS 1
 
 /* Define to 1 if your compiler understands __builtin_$op_overflow. */
 #define HAVE__BUILTIN_OP_OVERFLOW 1
@@ -796,7 +805,7 @@
 #define PACKAGE_NAME "PostgreSQL"
 
 /* Define to the full name and version of this package. */
-#define PACKAGE_STRING "PostgreSQL 14.0"
+#define PACKAGE_STRING "PostgreSQL 14.11"
 
 /* Define to the one symbol short name of this package. */
 #define PACKAGE_TARNAME "postgresql"
@@ -805,7 +814,7 @@
 #define PACKAGE_URL "https://www.postgresql.org/"
 
 /* Define to the version of this package. */
-#define PACKAGE_VERSION "14.0"
+#define PACKAGE_VERSION "14.11"
 
 /* Define to the name of a signed 128-bit integer type. */
 #define PG_INT128_TYPE __int128
@@ -824,7 +833,7 @@
 #define PG_MAJORVERSION_NUM 14
 
 /* PostgreSQL minor version number */
-#define PG_MINORVERSION_NUM 0
+#define PG_MINORVERSION_NUM 11
 
 /* Define to best printf format archetype, usually gnu_printf if available. */
 #define PG_PRINTF_ATTRIBUTE gnu_printf
@@ -833,13 +842,13 @@
 #define PG_USE_STDBOOL 1
 
 /* PostgreSQL version as a string */
-#define PG_VERSION "14.0"
+#define PG_VERSION "14.11"
 
 /* PostgreSQL version as a number */
-#define PG_VERSION_NUM 140000
+#define PG_VERSION_NUM 140011
 
 /* A string containing the version number, platform, and C compiler */
-#define PG_VERSION_STR "PostgreSQL 14.0 on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0, 64-bit"
+#define PG_VERSION_STR "PostgreSQL 14.11 on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0, 64-bit"
 
 /* Define to 1 to allow profiling output to be saved separately for each
    process. */

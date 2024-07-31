@@ -1102,6 +1102,10 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 
 		objDesc = getObjectDescription(obj, false);
 
+		/* An object being dropped concurrently doesn't need to be reported */
+		if (objDesc == NULL)
+			continue;
+
 		/*
 		 * If, at any stage of the recursive search, we reached the object via
 		 * an AUTO, INTERNAL, PARTITION, or EXTENSION dependency, then it's
@@ -1127,23 +1131,28 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 			char	   *otherDesc = getObjectDescription(&extra->dependee,
 														 false);
 
-			if (numReportedClient < MAX_REPORTED_DEPS)
+			if (otherDesc)
 			{
+				if (numReportedClient < MAX_REPORTED_DEPS)
+				{
+					/* separate entries with a newline */
+					if (clientdetail.len != 0)
+						appendStringInfoChar(&clientdetail, '\n');
+					appendStringInfo(&clientdetail, _("%s depends on %s"),
+									 objDesc, otherDesc);
+					numReportedClient++;
+				}
+				else
+					numNotReportedClient++;
 				/* separate entries with a newline */
-				if (clientdetail.len != 0)
-					appendStringInfoChar(&clientdetail, '\n');
-				appendStringInfo(&clientdetail, _("%s depends on %s"),
+				if (logdetail.len != 0)
+					appendStringInfoChar(&logdetail, '\n');
+				appendStringInfo(&logdetail, _("%s depends on %s"),
 								 objDesc, otherDesc);
-				numReportedClient++;
+				pfree(otherDesc);
 			}
 			else
 				numNotReportedClient++;
-			/* separate entries with a newline */
-			if (logdetail.len != 0)
-				appendStringInfoChar(&logdetail, '\n');
-			appendStringInfo(&logdetail, _("%s depends on %s"),
-							 objDesc, otherDesc);
-			pfree(otherDesc);
 			ok = false;
 		}
 		else
@@ -1184,14 +1193,14 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 					 errmsg("cannot drop %s because other objects depend on it",
 							getObjectDescription(origObject, false)),
-					 errdetail("%s", clientdetail.data),
+					 errdetail_internal("%s", clientdetail.data),
 					 errdetail_log("%s", logdetail.data),
 					 errhint("Use DROP ... CASCADE to drop the dependent objects too.")));
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 					 errmsg("cannot drop desired object(s) because other objects depend on them"),
-					 errdetail("%s", clientdetail.data),
+					 errdetail_internal("%s", clientdetail.data),
 					 errdetail_log("%s", logdetail.data),
 					 errhint("Use DROP ... CASCADE to drop the dependent objects too.")));
 	}
@@ -1203,7 +1212,7 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 							   "drop cascades to %d other objects",
 							   numReportedClient + numNotReportedClient,
 							   numReportedClient + numNotReportedClient),
-				 errdetail("%s", clientdetail.data),
+				 errdetail_internal("%s", clientdetail.data),
 				 errdetail_log("%s", logdetail.data)));
 	}
 	else if (numReportedClient == 1)
@@ -1831,6 +1840,13 @@ find_expr_references_walker(Node *node,
 					if (SearchSysCacheExists1(TYPEOID,
 											  ObjectIdGetDatum(objoid)))
 						add_object_address(OCLASS_TYPE, objoid, 0,
+										   context->addrs);
+					break;
+				case REGCOLLATIONOID:
+					objoid = DatumGetObjectId(con->constvalue);
+					if (SearchSysCacheExists1(COLLOID,
+											  ObjectIdGetDatum(objoid)))
+						add_object_address(OCLASS_COLLATION, objoid, 0,
 										   context->addrs);
 					break;
 				case REGCONFIGOID:

@@ -302,6 +302,22 @@ verify_heapam(PG_FUNCTION_ARGS)
 	ctx.rel = relation_open(relid, AccessShareLock);
 	sanity_check_relation(ctx.rel);
 
+	/*
+	 * Early exit for unlogged relations during recovery.  These will have no
+	 * relation fork, so there won't be anything to check.  We behave as if
+	 * the relation is empty.
+	 */
+	if (ctx.rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED &&
+		RecoveryInProgress())
+	{
+		ereport(DEBUG1,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot verify unlogged relation \"%s\" during recovery, skipping",
+						RelationGetRelationName(ctx.rel))));
+		relation_close(ctx.rel, AccessShareLock);
+		PG_RETURN_NULL();
+	}
+
 	/* Early exit if the relation is empty */
 	nblocks = RelationGetNumberOfBlocks(ctx.rel);
 	if (!nblocks)
@@ -758,6 +774,8 @@ check_tuple_visibility(HeapCheckContext *ctx)
 	switch (get_xid_status(xmin, ctx, &xmin_status))
 	{
 		case XID_INVALID:
+			/* Could be the result of a speculative insertion that aborted. */
+			return false;
 		case XID_BOUNDS_OK:
 			break;
 		case XID_IN_FUTURE:
@@ -1093,6 +1111,9 @@ check_tuple_visibility(HeapCheckContext *ctx)
 	xmax = HeapTupleHeaderGetRawXmax(tuphdr);
 	switch (get_xid_status(xmax, ctx, &xmax_status))
 	{
+		case XID_INVALID:
+			ctx->tuple_could_be_pruned = false;
+			return true;
 		case XID_IN_FUTURE:
 			report_corruption(ctx,
 							  psprintf("xmax %u equals or exceeds next valid transaction ID %u:%u",
@@ -1115,7 +1136,6 @@ check_tuple_visibility(HeapCheckContext *ctx)
 									   XidFromFullTransactionId(ctx->oldest_fxid)));
 			return false;		/* corrupt */
 		case XID_BOUNDS_OK:
-		case XID_INVALID:
 			break;
 	}
 
@@ -1560,14 +1580,40 @@ check_tuple(HeapCheckContext *ctx)
 static FullTransactionId
 FullTransactionIdFromXidAndCtx(TransactionId xid, const HeapCheckContext *ctx)
 {
-	uint32		epoch;
+	uint64		nextfxid_i;
+	int32		diff;
+	FullTransactionId fxid;
+
+	Assert(TransactionIdIsNormal(ctx->next_xid));
+	Assert(FullTransactionIdIsNormal(ctx->next_fxid));
+	Assert(XidFromFullTransactionId(ctx->next_fxid) == ctx->next_xid);
 
 	if (!TransactionIdIsNormal(xid))
 		return FullTransactionIdFromEpochAndXid(0, xid);
-	epoch = EpochFromFullTransactionId(ctx->next_fxid);
-	if (xid > ctx->next_xid)
-		epoch--;
-	return FullTransactionIdFromEpochAndXid(epoch, xid);
+
+	nextfxid_i = U64FromFullTransactionId(ctx->next_fxid);
+
+	/* compute the 32bit modulo difference */
+	diff = (int32) (ctx->next_xid - xid);
+
+	/*
+	 * In cases of corruption we might see a 32bit xid that is before epoch
+	 * 0. We can't represent that as a 64bit xid, due to 64bit xids being
+	 * unsigned integers, without the modulo arithmetic of 32bit xid. There's
+	 * no really nice way to deal with that, but it works ok enough to use
+	 * FirstNormalFullTransactionId in that case, as a freshly initdb'd
+	 * cluster already has a newer horizon.
+	 */
+	if (diff > 0 && (nextfxid_i - FirstNormalTransactionId) < (int64) diff)
+	{
+		Assert(EpochFromFullTransactionId(ctx->next_fxid) == 0);
+		fxid = FirstNormalFullTransactionId;
+	}
+	else
+		fxid = FullTransactionIdFromU64(nextfxid_i - diff);
+
+	Assert(FullTransactionIdIsNormal(fxid));
+	return fxid;
 }
 
 /*
@@ -1583,8 +1629,8 @@ update_cached_xid_range(HeapCheckContext *ctx)
 	LWLockRelease(XidGenLock);
 
 	/* And compute alternate versions of the same */
-	ctx->oldest_fxid = FullTransactionIdFromXidAndCtx(ctx->oldest_xid, ctx);
 	ctx->next_xid = XidFromFullTransactionId(ctx->next_fxid);
+	ctx->oldest_fxid = FullTransactionIdFromXidAndCtx(ctx->oldest_xid, ctx);
 }
 
 /*

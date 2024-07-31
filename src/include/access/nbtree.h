@@ -1029,8 +1029,10 @@ typedef struct BTArrayKeyInfo
 
 typedef struct BTScanOpaqueData
 {
-	/* these fields are set by _bt_preprocess_keys(): */
+	/* all fields (except arraysStarted) are set by _bt_preprocess_keys(): */
 	bool		qual_ok;		/* false if qual can never be satisfied */
+	bool		arraysStarted;	/* Started array keys, but have yet to "reach
+								 * past the end" of all arrays? */
 	int			numberOfKeys;	/* number of preprocessed scan keys */
 	ScanKey		keyData;		/* array of preprocessed scan keys */
 
@@ -1198,7 +1200,7 @@ extern int	_bt_getrootheight(Relation rel);
 extern void _bt_metaversion(Relation rel, bool *heapkeyspace,
 							bool *allequalimage);
 extern void _bt_checkpage(Relation rel, Buffer buf);
-extern Buffer _bt_getbuf(Relation rel, BlockNumber blkno, int access);
+extern Buffer _bt_getbuf_rename2(Relation rel, BlockNumber blkno, int access, char* fileName, int line);
 extern Buffer _bt_relandgetbuf(Relation rel, Buffer obuf,
 							   BlockNumber blkno, int access);
 extern void _bt_relbuf(Relation rel, Buffer buf);

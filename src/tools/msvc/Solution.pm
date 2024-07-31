@@ -229,7 +229,6 @@ sub GenerateFiles
 		HAVE_ATOMICS               => 1,
 		HAVE_ATOMIC_H              => undef,
 		HAVE_BACKTRACE_SYMBOLS     => undef,
-		HAVE_BIO_GET_DATA          => undef,
 		HAVE_BIO_METH_NEW          => undef,
 		HAVE_CLOCK_GETTIME         => undef,
 		HAVE_COMPUTED_GOTO         => undef,
@@ -399,6 +398,7 @@ sub GenerateFiles
 		HAVE_SYS_EPOLL_H                         => undef,
 		HAVE_SYS_EVENT_H                         => undef,
 		HAVE_SYS_IPC_H                           => undef,
+		HAVE_SYS_PERSONALITY_H                   => undef,
 		HAVE_SYS_PRCTL_H                         => undef,
 		HAVE_SYS_PROCCTL_H                       => undef,
 		HAVE_SYS_PSTAT_H                         => undef,
@@ -406,6 +406,7 @@ sub GenerateFiles
 		HAVE_SYS_SELECT_H                        => undef,
 		HAVE_SYS_SEM_H                           => undef,
 		HAVE_SYS_SHM_H                           => undef,
+		HAVE_SYS_SIGNALFD_H                      => undef,
 		HAVE_SYS_SOCKIO_H                        => undef,
 		HAVE_SYS_STAT_H                          => 1,
 		HAVE_SYS_TAS_H                           => undef,
@@ -432,6 +433,7 @@ sub GenerateFiles
 		HAVE_WCTYPE_H                            => 1,
 		HAVE_WRITEV                              => undef,
 		HAVE_X509_GET_SIGNATURE_NID              => 1,
+		HAVE_X509_GET_SIGNATURE_INFO             => undef,
 		HAVE_X86_64_POPCNTQ                      => undef,
 		HAVE__BOOL                               => undef,
 		HAVE__BUILTIN_BSWAP16                    => undef,
@@ -440,6 +442,7 @@ sub GenerateFiles
 		HAVE__BUILTIN_CLZ                        => undef,
 		HAVE__BUILTIN_CONSTANT_P                 => undef,
 		HAVE__BUILTIN_CTZ                        => undef,
+		HAVE__BUILTIN_FRAME_ADDRESS              => undef,
 		HAVE__BUILTIN_OP_OVERFLOW                => undef,
 		HAVE__BUILTIN_POPCOUNT                   => undef,
 		HAVE__BUILTIN_TYPES_COMPATIBLE_P         => undef,
@@ -546,11 +549,18 @@ sub GenerateFiles
 
 		my ($digit1, $digit2, $digit3) = $self->GetOpenSSLVersion();
 
-		# More symbols are needed with OpenSSL 1.1.0 and above.
-		if ($digit1 >= '1' && $digit2 >= '1' && $digit3 >= '0')
+		# Symbols needed with OpenSSL 1.1.1 and above.
+		if (   ($digit1 >= '3' && $digit2 >= '0' && $digit3 >= '0')
+			|| ($digit1 >= '1' && $digit2 >= '1' && $digit3 >= '1'))
+		{
+			$define{HAVE_X509_GET_SIGNATURE_INFO} = 1;
+		}
+
+		# Symbols needed with OpenSSL 1.1.0 and above.
+		if (   ($digit1 >= '3' && $digit2 >= '0' && $digit3 >= '0')
+			|| ($digit1 >= '1' && $digit2 >= '1' && $digit3 >= '0'))
 		{
 			$define{HAVE_ASN1_STRING_GET0_DATA} = 1;
-			$define{HAVE_BIO_GET_DATA}          = 1;
 			$define{HAVE_BIO_METH_NEW}          = 1;
 			$define{HAVE_HMAC_CTX_FREE}         = 1;
 			$define{HAVE_HMAC_CTX_NEW}          = 1;
@@ -955,7 +965,8 @@ sub AddProject
 		# changed their library names from:
 		# - libeay to libcrypto
 		# - ssleay to libssl
-		if ($digit1 >= '1' && $digit2 >= '1' && $digit3 >= '0')
+		if (   ($digit1 >= '3' && $digit2 >= '0' && $digit3 >= '0')
+			|| ($digit1 >= '1' && $digit2 >= '1' && $digit3 >= '0'))
 		{
 			my $dbgsuffix;
 			my $libsslpath;
@@ -1310,6 +1321,34 @@ sub new
 	$self->{vcver}                      = '16.00';
 	$self->{visualStudioName}           = 'Visual Studio 2019';
 	$self->{VisualStudioVersion}        = '16.0.28729.10';
+	$self->{MinimumVisualStudioVersion} = '10.0.40219.1';
+
+	return $self;
+}
+
+package VS2022Solution;
+
+#
+# Package that encapsulates a Visual Studio 2022 solution file
+#
+
+use Carp;
+use strict;
+use warnings;
+use base qw(Solution);
+
+no warnings qw(redefine);    ## no critic
+
+sub new
+{
+	my $classname = shift;
+	my $self      = $classname->SUPER::_new(@_);
+	bless($self, $classname);
+
+	$self->{solutionFileVersion}        = '12.00';
+	$self->{vcver}                      = '17.00';
+	$self->{visualStudioName}           = 'Visual Studio 2022';
+	$self->{VisualStudioVersion}        = '17.0.31903.59';
 	$self->{MinimumVisualStudioVersion} = '10.0.40219.1';
 
 	return $self;

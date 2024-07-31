@@ -26,6 +26,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/placeholder.h"
 #include "optimizer/planmain.h"
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
@@ -56,6 +57,10 @@ static int	append_startup_cost_compare(const ListCell *a, const ListCell *b);
 static List *reparameterize_pathlist_by_child(PlannerInfo *root,
 											  List *pathlist,
 											  RelOptInfo *child_rel);
+static bool contain_references_to(PlannerInfo *root, Node *clause,
+								  Relids relids);
+static bool ris_contain_references_to(PlannerInfo *root, List *rinfos,
+									  Relids relids);
 
 
 /*****************************************************************************
@@ -1583,7 +1588,7 @@ create_material_path(RelOptInfo *rel, Path *subpath)
 MemoizePath *
 create_memoize_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 					List *param_exprs, List *hash_operators,
-					bool singlerow, double calls)
+					bool singlerow, bool binary_mode, double calls)
 {
 	MemoizePath *pathnode = makeNode(MemoizePath);
 
@@ -1603,6 +1608,7 @@ create_memoize_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	pathnode->hash_operators = hash_operators;
 	pathnode->param_exprs = param_exprs;
 	pathnode->singlerow = singlerow;
+	pathnode->binary_mode = binary_mode;
 	pathnode->calls = calls;
 
 	/*
@@ -3338,7 +3344,7 @@ create_minmaxagg_path(PlannerInfo *root,
 	/* For now, assume we are above any joins, so no parameterization */
 	pathnode->path.param_info = NULL;
 	pathnode->path.parallel_aware = false;
-	/* A MinMaxAggPath implies use of subplans, so cannot be parallel-safe */
+	/* A MinMaxAggPath implies use of initplans, so cannot be parallel-safe */
 	pathnode->path.parallel_safe = false;
 	pathnode->path.parallel_workers = 0;
 	/* Result is one unordered row */
@@ -3608,7 +3614,7 @@ create_lockrows_path(PlannerInfo *root, RelOptInfo *rel,
  * 'operation' is the operation type
  * 'canSetTag' is true if we set the command tag/es_processed
  * 'nominalRelation' is the parent RT index for use of EXPLAIN
- * 'rootRelation' is the partitioned table root RT index, or 0 if none
+ * 'rootRelation' is the partitioned/inherited table root RTI, or 0 if none
  * 'partColsUpdated' is true if any partitioning columns are being updated,
  *		either from the target relation or a descendent partitioned table.
  * 'resultRelations' is an integer list of actual RT indexes of target rel(s)
@@ -3936,12 +3942,19 @@ reparameterize_path(PlannerInfo *root, Path *path,
 		case T_Memoize:
 			{
 				MemoizePath *mpath = (MemoizePath *) path;
+				Path	   *spath = mpath->subpath;
 
+				spath = reparameterize_path(root, spath,
+											required_outer,
+											loop_count);
+				if (spath == NULL)
+					return NULL;
 				return (Path *) create_memoize_path(root, rel,
-													mpath->subpath,
+													spath,
 													mpath->param_exprs,
 													mpath->hash_operators,
 													mpath->singlerow,
+													mpath->binary_mode,
 													mpath->calls);
 			}
 		default:
@@ -4029,12 +4042,58 @@ do { \
 	switch (nodeTag(path))
 	{
 		case T_Path:
+
+			/*
+			 * If the path's restriction clauses contain lateral references to
+			 * the other relation, we can't reparameterize, because we must
+			 * not change the RelOptInfo's contents here.  (Doing so would
+			 * break things if we end up using a non-partitionwise join.)
+			 */
+			if (ris_contain_references_to(root,
+										  path->parent->baserestrictinfo,
+										  child_rel->top_parent_relids))
+				return NULL;
+
+			/*
+			 * If it's a SampleScan with tablesample parameters referencing
+			 * the other relation, we can't reparameterize, because we must
+			 * not change the RTE's contents here.  (Doing so would break
+			 * things if we end up using a non-partitionwise join.)
+			 */
+			if (path->pathtype == T_SampleScan)
+			{
+				Index		scan_relid = path->parent->relid;
+				RangeTblEntry *rte;
+
+				/* it should be a base rel with a tablesample clause... */
+				Assert(scan_relid > 0);
+				rte = planner_rt_fetch(scan_relid, root);
+				Assert(rte->rtekind == RTE_RELATION);
+				Assert(rte->tablesample != NULL);
+
+				if (contain_references_to(root, (Node *) rte->tablesample,
+										  child_rel->top_parent_relids))
+					return NULL;
+			}
+
 			FLAT_COPY_PATH(new_path, path, Path);
 			break;
 
 		case T_IndexPath:
 			{
 				IndexPath  *ipath;
+
+				/*
+				 * If the path's restriction clauses contain lateral
+				 * references to the other relation, we can't reparameterize,
+				 * because we must not change the IndexOptInfo's contents
+				 * here.  (Doing so would break things if we end up using a
+				 * non-partitionwise join.)
+				 */
+				if (ris_contain_references_to(root,
+											  path->parent->baserestrictinfo,
+											  child_rel->top_parent_relids))
+					return NULL;
 
 				FLAT_COPY_PATH(ipath, path, IndexPath);
 				ADJUST_CHILD_ATTRS(ipath->indexclauses);
@@ -4045,6 +4104,18 @@ do { \
 		case T_BitmapHeapPath:
 			{
 				BitmapHeapPath *bhpath;
+
+				/*
+				 * If the path's restriction clauses contain lateral
+				 * references to the other relation, we can't reparameterize,
+				 * because we must not change the RelOptInfo's contents here.
+				 * (Doing so would break things if we end up using a
+				 * non-partitionwise join.)
+				 */
+				if (ris_contain_references_to(root,
+											  path->parent->baserestrictinfo,
+											  child_rel->top_parent_relids))
+					return NULL;
 
 				FLAT_COPY_PATH(bhpath, path, BitmapHeapPath);
 				REPARAMETERIZE_CHILD_PATH(bhpath->bitmapqual);
@@ -4077,6 +4148,18 @@ do { \
 				ForeignPath *fpath;
 				ReparameterizeForeignPathByChild_function rfpc_func;
 
+				/*
+				 * If the path's restriction clauses contain lateral
+				 * references to the other relation, we can't reparameterize,
+				 * because we must not change the RelOptInfo's contents here.
+				 * (Doing so would break things if we end up using a
+				 * non-partitionwise join.)
+				 */
+				if (ris_contain_references_to(root,
+											  path->parent->baserestrictinfo,
+											  child_rel->top_parent_relids))
+					return NULL;
+
 				FLAT_COPY_PATH(fpath, path, ForeignPath);
 				if (fpath->fdw_outerpath)
 					REPARAMETERIZE_CHILD_PATH(fpath->fdw_outerpath);
@@ -4094,6 +4177,18 @@ do { \
 		case T_CustomPath:
 			{
 				CustomPath *cpath;
+
+				/*
+				 * If the path's restriction clauses contain lateral
+				 * references to the other relation, we can't reparameterize,
+				 * because we must not change the RelOptInfo's contents here.
+				 * (Doing so would break things if we end up using a
+				 * non-partitionwise join.)
+				 */
+				if (ris_contain_references_to(root,
+											  path->parent->baserestrictinfo,
+											  child_rel->top_parent_relids))
+					return NULL;
 
 				FLAT_COPY_PATH(cpath, path, CustomPath);
 				REPARAMETERIZE_CHILD_PATH_LIST(cpath->custom_paths);
@@ -4168,6 +4263,7 @@ do { \
 
 				FLAT_COPY_PATH(mpath, path, MemoizePath);
 				REPARAMETERIZE_CHILD_PATH(mpath->subpath);
+				ADJUST_CHILD_ATTRS(mpath->param_exprs);
 				new_path = (Path *) mpath;
 			}
 			break;
@@ -4269,4 +4365,92 @@ reparameterize_pathlist_by_child(PlannerInfo *root,
 	}
 
 	return result;
+}
+
+/*
+ * contain_references_to
+ *		Detect whether any Vars or PlaceHolderVars in the given clause contain
+ *		lateral references to the given 'relids'.
+ */
+static bool
+contain_references_to(PlannerInfo *root, Node *clause, Relids relids)
+{
+	bool		ret = false;
+	List	   *vars;
+	ListCell   *lc;
+
+	/*
+	 * Examine all Vars and PlaceHolderVars used in the clause.
+	 *
+	 * By omitting the relevant flags, this also gives us a cheap sanity check
+	 * that no aggregates or window functions appear in the clause.  We don't
+	 * expect any of those in scan-level restrictions or tablesamples.
+	 */
+	vars = pull_var_clause(clause, PVC_INCLUDE_PLACEHOLDERS);
+	foreach(lc, vars)
+	{
+		Node	   *node = (Node *) lfirst(lc);
+
+		if (IsA(node, Var))
+		{
+			Var		   *var = (Var *) node;
+
+			if (bms_is_member(var->varno, relids))
+			{
+				ret = true;
+				break;
+			}
+		}
+		else if (IsA(node, PlaceHolderVar))
+		{
+			PlaceHolderVar *phv = (PlaceHolderVar *) node;
+			PlaceHolderInfo *phinfo = find_placeholder_info(root, phv, false);
+
+			/*
+			 * We should check both ph_eval_at (in case the PHV is to be
+			 * computed at the other relation and then laterally referenced
+			 * here) and ph_lateral (in case the PHV is to be evaluated here
+			 * but contains lateral references to the other relation).  The
+			 * former case should not occur in baserestrictinfo clauses, but
+			 * it can occur in tablesample clauses.
+			 */
+			if (bms_overlap(phinfo->ph_eval_at, relids) ||
+				bms_overlap(phinfo->ph_lateral, relids))
+			{
+				ret = true;
+				break;
+			}
+		}
+		else
+			Assert(false);
+	}
+
+	list_free(vars);
+
+	return ret;
+}
+
+/*
+ * ris_contain_references_to
+ *		Apply contain_references_to() to a list of RestrictInfos.
+ *
+ * We need extra code for this because pull_var_clause() can't descend
+ * through RestrictInfos.
+ */
+static bool
+ris_contain_references_to(PlannerInfo *root, List *rinfos, Relids relids)
+{
+	ListCell   *lc;
+
+	foreach(lc, rinfos)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+		/* Pseudoconstant clauses can't contain any Vars or PHVs */
+		if (rinfo->pseudoconstant)
+			continue;
+		if (contain_references_to(root, (Node *) rinfo->clause, relids))
+			return true;
+	}
+	return false;
 }

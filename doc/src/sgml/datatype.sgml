@@ -1177,6 +1177,8 @@ SELECT '52093.89'::money::numeric::float8;
     <type>char(<replaceable>n</replaceable>)</type> are aliases for <type>character
     varying(<replaceable>n</replaceable>)</type> and
     <type>character(<replaceable>n</replaceable>)</type>, respectively.
+    If specified, the length must be greater than zero and cannot exceed
+    10485760.
     <type>character</type> without length specifier is equivalent to
     <type>character(1)</type>. If <type>character varying</type> is used
     without length specifier, the type accepts strings of any size. The
@@ -1436,7 +1438,12 @@ SELECT b, char_length(b) FROM test2;
    <para>
     Example:
 <programlisting>
-SELECT '\xDEADBEEF';
+SET bytea_output = 'hex';
+
+SELECT '\xDEADBEEF'::bytea;
+   bytea
+------------
+ \xdeadbeef
 </programlisting>
    </para>
   </sect2>
@@ -1979,7 +1986,8 @@ MINUTE TO SECOND
       <literal>America/New_York</literal>. In this case specifying the date
       is required in order to determine whether standard or daylight-savings
       time applies.  The appropriate time zone offset is recorded in the
-      <type>time with time zone</type> value.
+      <type>time with time zone</type> value and is output as stored;
+      it is not adjusted to the active time zone.
      </para>
 
       <table id="datatype-datetime-time-table">
@@ -3863,13 +3871,13 @@ SELECT person.name, holidays.num_weeks FROM person, holidays
     </para>
 
     <para>
-     IEEE Std 802-2001 specifies the second shown form (with hyphens)
+     IEEE Standard 802-2001 specifies the second form shown (with hyphens)
      as the canonical form for MAC addresses, and specifies the first
-     form (with colons) as the bit-reversed notation, so that
-     08-00-2b-01-02-03 = 01:00:4D:08:04:0C.  This convention is widely
+     form (with colons) as used with bit-reversed, MSB-first notation, so that
+     08-00-2b-01-02-03 = 10:00:D4:80:40:C0.  This convention is widely
      ignored nowadays, and it is relevant only for obsolete network
      protocols (such as Token Ring).  PostgreSQL makes no provisions
-     for bit reversal, and all accepted formats use the canonical LSB
+     for bit reversal; all accepted formats use the canonical LSB
      order.
     </para>
 

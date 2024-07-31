@@ -415,8 +415,6 @@ heap_create(const char *relname,
 	 */
 	if (create_storage)
 	{
-		RelationOpenSmgr(rel);
-
 		switch (rel->rd_rel->relkind)
 		{
 			case RELKIND_VIEW:
@@ -765,6 +763,9 @@ InsertPgAttributeTuples(Relation pg_attribute_rel,
 		Form_pg_attribute attrs = TupleDescAttr(tupdesc, natts);
 
 		ExecClearTuple(slot[slotCount]);
+
+		memset(slot[slotCount]->tts_isnull, false,
+			   slot[slotCount]->tts_tupleDescriptor->natts * sizeof(bool));
 
 		if (new_rel_oid != InvalidOid)
 			slot[slotCount]->tts_values[Anum_pg_attribute_attrelid - 1] = ObjectIdGetDatum(new_rel_oid);
@@ -2657,7 +2658,8 @@ AddRelationNewConstraints(Relation rel,
 			continue;
 
 		/* If the DEFAULT is volatile we cannot use a missing value */
-		if (colDef->missingMode && contain_volatile_functions((Node *) expr))
+		if (colDef->missingMode &&
+			contain_volatile_functions_after_planning((Expr *) expr))
 			colDef->missingMode = false;
 
 		defOid = StoreAttrDefault(rel, colDef->attnum, expr, is_internal,
@@ -3092,9 +3094,11 @@ cookDefault(ParseState *pstate,
 
 	if (attgenerated)
 	{
+		/* Disallow refs to other generated columns */
 		check_nested_generated(pstate, expr);
 
-		if (contain_mutable_functions(expr))
+		/* Disallow mutable functions */
+		if (contain_mutable_functions_after_planning((Expr *) expr))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("generation expression is not immutable")));

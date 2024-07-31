@@ -573,6 +573,7 @@ _outIndexOnlyScan(StringInfo str, const IndexOnlyScan *node)
 
 	WRITE_OID_FIELD(indexid);
 	WRITE_NODE_FIELD(indexqual);
+	WRITE_NODE_FIELD(recheckqual);
 	WRITE_NODE_FIELD(indexorderby);
 	WRITE_NODE_FIELD(indextlist);
 	WRITE_ENUM_FIELD(indexorderdir, ScanDirection);
@@ -859,7 +860,9 @@ _outMemoize(StringInfo str, const Memoize *node)
 	WRITE_OID_ARRAY(collations, node->numKeys);
 	WRITE_NODE_FIELD(param_exprs);
 	WRITE_BOOL_FIELD(singlerow);
+	WRITE_BOOL_FIELD(binary_mode);
 	WRITE_UINT_FIELD(est_entries);
+	WRITE_BITMAPSET_FIELD(keyparamids);
 }
 
 static void
@@ -1958,6 +1961,7 @@ _outMemoizePath(StringInfo str, const MemoizePath *node)
 	WRITE_NODE_FIELD(hash_operators);
 	WRITE_NODE_FIELD(param_exprs);
 	WRITE_BOOL_FIELD(singlerow);
+	WRITE_BOOL_FIELD(binary_mode);
 	WRITE_FLOAT_FIELD(calls, "%.0f");
 	WRITE_UINT_FIELD(est_entries);
 }
@@ -3668,8 +3672,7 @@ _outConstraint(StringInfo str, const Constraint *node)
 
 		case CONSTR_IDENTITY:
 			appendStringInfoString(str, "IDENTITY");
-			WRITE_NODE_FIELD(raw_expr);
-			WRITE_STRING_FIELD(cooked_expr);
+			WRITE_NODE_FIELD(options);
 			WRITE_CHAR_FIELD(generated_when);
 			break;
 
@@ -3685,6 +3688,8 @@ _outConstraint(StringInfo str, const Constraint *node)
 			WRITE_BOOL_FIELD(is_no_inherit);
 			WRITE_NODE_FIELD(raw_expr);
 			WRITE_STRING_FIELD(cooked_expr);
+			WRITE_BOOL_FIELD(skip_validation);
+			WRITE_BOOL_FIELD(initially_valid);
 			break;
 
 		case CONSTR_PRIMARY:

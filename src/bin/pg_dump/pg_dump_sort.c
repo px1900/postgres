@@ -34,6 +34,15 @@
  * restore state).  If you think to change this, see also the RestorePass
  * mechanism in pg_backup_archiver.c.
  *
+ * On the other hand, casts are intentionally sorted earlier than you might
+ * expect; logically they should come after functions, since they usually
+ * depend on those.  This works around the backend's habit of recording
+ * views that use casts as dependent on the cast's underlying function.
+ * We initially sort casts first, and then any functions used by casts
+ * will be hoisted above the casts, and in turn views that those functions
+ * depend on will be hoisted above the functions.  But views not used that
+ * way won't be hoisted.
+ *
  * NOTE: object-type priorities must match the section assignments made in
  * pg_dump.c; that is, PRE_DATA objects must sort before DO_PRE_DATA_BOUNDARY,
  * POST_DATA objects must sort after DO_POST_DATA_BOUNDARY, and DATA objects
@@ -49,12 +58,12 @@ enum dbObjectTypePriorities
 	PRIO_TRANSFORM,
 	PRIO_EXTENSION,
 	PRIO_TYPE,					/* used for DO_TYPE and DO_SHELL_TYPE */
+	PRIO_CAST,
 	PRIO_FUNC,
 	PRIO_AGG,
 	PRIO_ACCESS_METHOD,
 	PRIO_OPERATOR,
 	PRIO_OPFAMILY,				/* used for DO_OPFAMILY and DO_OPCLASS */
-	PRIO_CAST,
 	PRIO_CONVERSION,
 	PRIO_TSPARSER,
 	PRIO_TSTEMPLATE,
@@ -858,6 +867,28 @@ repairMatViewBoundaryMultiLoop(DumpableObject *boundaryobj,
 }
 
 /*
+ * If a function is involved in a multi-object loop, we can't currently fix
+ * that by splitting it into two DumpableObjects.  As a stopgap, we try to fix
+ * it by dropping the constraint that the function be dumped in the pre-data
+ * section.  This is sufficient to handle cases where a function depends on
+ * some unique index, as can happen if it has a GROUP BY for example.
+ */
+static void
+repairFunctionBoundaryMultiLoop(DumpableObject *boundaryobj,
+								DumpableObject *nextobj)
+{
+	/* remove boundary's dependency on object after it in loop */
+	removeObjectDependency(boundaryobj, nextobj->dumpId);
+	/* if that object is a function, mark it as postponed into post-data */
+	if (nextobj->objType == DO_FUNC)
+	{
+		FuncInfo   *nextinfo = (FuncInfo *) nextobj;
+
+		nextinfo->postponed_def = true;
+	}
+}
+
+/*
  * Because we make tables depend on their CHECK constraints, while there
  * will be an automatic dependency in the other direction, we need to break
  * the loop.  If there are no other objects in the loop then we can remove
@@ -1044,6 +1075,28 @@ repairDependencyLoop(DumpableObject **loop,
 
 						nextobj = (j < nLoop - 1) ? loop[j + 1] : loop[0];
 						repairMatViewBoundaryMultiLoop(loop[j], nextobj);
+						return;
+					}
+				}
+			}
+		}
+	}
+
+	/* Indirect loop involving function and data boundary */
+	if (nLoop > 2)
+	{
+		for (i = 0; i < nLoop; i++)
+		{
+			if (loop[i]->objType == DO_FUNC)
+			{
+				for (j = 0; j < nLoop; j++)
+				{
+					if (loop[j]->objType == DO_PRE_DATA_BOUNDARY)
+					{
+						DumpableObject *nextobj;
+
+						nextobj = (j < nLoop - 1) ? loop[j + 1] : loop[0];
+						repairFunctionBoundaryMultiLoop(loop[j], nextobj);
 						return;
 					}
 				}

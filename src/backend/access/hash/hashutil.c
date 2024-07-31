@@ -235,9 +235,10 @@ _hash_checkpage(Relation rel, Buffer buf, int flags)
 	if (PageGetSpecialSize(page) != MAXALIGN(sizeof(HashPageOpaqueData)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("index \"%s\" contains corrupted page at block %u",
+				 errmsg("hash_checkpage index \"%s\" contains corrupted page at block %u, spc %u, db %u, rel %u",
 						RelationGetRelationName(rel),
 						BufferGetBlockNumber(buf)),
+						rel->rd_node.spcNode, rel->rd_node.dbNode, rel->rd_node.relNode,
 				 errhint("Please REINDEX it.")));
 
 	if (flags)
@@ -247,9 +248,10 @@ _hash_checkpage(Relation rel, Buffer buf, int flags)
 		if ((opaque->hasho_flag & flags) == 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_INDEX_CORRUPTED),
-					 errmsg("index \"%s\" contains corrupted page at block %u",
+				 	 errmsg("hash_checkpage2 index \"%s\" contains corrupted page at block %u, spc %u, db %u, rel %u",
 							RelationGetRelationName(rel),
 							BufferGetBlockNumber(buf)),
+							rel->rd_node.spcNode, rel->rd_node.dbNode, rel->rd_node.relNode,
 					 errhint("Please REINDEX it.")));
 	}
 

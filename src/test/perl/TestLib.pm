@@ -24,7 +24,6 @@ TestLib - helper module for writing PostgreSQL's C<prove> tests.
 
   # Miscellanea
   print "on Windows" if $TestLib::windows_os;
-  my $path = TestLib::perl2host($backup_dir);
   ok(check_mode_recursive($stream_dir, 0700, 0600),
     "check stream dir permissions");
   TestLib::system_log('pg_ctl', 'kill', 'QUIT', $slow_pid);
@@ -71,10 +70,12 @@ our @EXPORT = qw(
   chmod_recursive
   check_pg_config
   dir_symlink
+  scan_server_header
   system_or_bail
   system_log
   run_log
   run_command
+  pump_until
 
   command_ok
   command_fails
@@ -92,8 +93,8 @@ our @EXPORT = qw(
   $use_unix_sockets
 );
 
-our ($windows_os, $is_msys2, $use_unix_sockets, $tmp_check, $log_path,
-	$test_logfile);
+our ($windows_os, $is_msys2, $use_unix_sockets, $timeout_default,
+	$tmp_check, $log_path, $test_logfile);
 
 BEGIN
 {
@@ -143,13 +144,14 @@ BEGIN
 	# Must be set early
 	$windows_os = $Config{osname} eq 'MSWin32' || $Config{osname} eq 'msys';
 	# Check if this environment is MSYS2.
-	$is_msys2 = $^O eq 'msys' && `uname -or` =~ /^[2-9].*Msys/;
+	$is_msys2 = $windows_os && -x '/usr/bin/uname'  &&
+	  `uname -or` =~ /^[2-9].*Msys/;
 
 	if ($windows_os)
 	{
 		require Win32API::File;
 		Win32API::File->import(
-			qw(createFile OsFHandleOpen CloseHandle setFilePointer));
+			qw(createFile OsFHandleOpen CloseHandle));
 	}
 
 	# Specifies whether to use Unix sockets for test setups.  On
@@ -157,6 +159,10 @@ BEGIN
 	# supported, but it can be overridden if desired.
 	$use_unix_sockets =
 	  (!$windows_os || defined $ENV{PG_TEST_USE_UNIX_SOCKETS});
+
+	$timeout_default = $ENV{PG_TEST_TIMEOUT_DEFAULT};
+	$timeout_default = 180
+	  if not defined $timeout_default or $timeout_default eq '';
 }
 
 =pod
@@ -263,7 +269,7 @@ sub all_tests_passing
 
 Securely create a temporary directory inside C<$tmp_check>, like C<mkdtemp>,
 and return its name.  The directory will be removed automatically at the
-end of the tests.
+end of the tests, unless the environment variable PG_TEST_NOCLEAN is provided.
 
 If C<prefix> is given, the new directory is templated as C<${prefix}_XXXX>.
 Otherwise the template is C<tmp_test_XXXX>.
@@ -277,7 +283,7 @@ sub tempdir
 	return File::Temp::tempdir(
 		$prefix . '_XXXX',
 		DIR     => $tmp_check,
-		CLEANUP => 1);
+		CLEANUP => not defined $ENV{'PG_TEST_NOCLEAN'});
 }
 
 =pod
@@ -292,62 +298,31 @@ name, to avoid path length issues.
 sub tempdir_short
 {
 
-	return File::Temp::tempdir(CLEANUP => 1);
+	return File::Temp::tempdir(
+		CLEANUP => not defined $ENV{'PG_TEST_NOCLEAN'});
 }
 
 =pod
 
-=item perl2host()
+=item has_wal_read_bug()
 
-Translate a virtual file name to a host file name.  Currently, this is a no-op
-except for the case of Perl=msys and host=mingw32.  The subject need not
-exist, but its parent or grandparent directory must exist unless cygpath is
-available.
-
-The returned path uses forward slashes but has no trailing slash.
+Returns true if $tmp_check is subject to a sparc64+ext4 bug that causes WAL
+readers to see zeros if another process simultaneously wrote the same offsets.
+Consult this in tests that fail frequently on affected configurations.  The
+bug has made streaming standbys fail to advance, reporting corrupt WAL.  It
+has made COMMIT PREPARED fail with "could not read two-phase state from WAL".
+Non-WAL PostgreSQL reads haven't been affected, likely because those readers
+and writers have buffering systems in common.  See
+https://postgr.es/m/20220116210241.GC756210@rfd.leadboat.com for details.
 
 =cut
 
-sub perl2host
+sub has_wal_read_bug
 {
-	my ($subject) = @_;
-	return $subject unless $Config{osname} eq 'msys';
-	if ($is_msys2)
-	{
-		# get absolute, windows type path
-		my $path = qx{cygpath -a -m "$subject"};
-		if (!$?)
-		{
-			chomp $path;
-			$path =~ s!/$!!;
-			return $path if $path;
-		}
-		# fall through if this didn't work.
-	}
-	my $here = cwd;
-	my $leaf;
-	if (chdir $subject)
-	{
-		$leaf = '';
-	}
-	else
-	{
-		$leaf = '/' . basename $subject;
-		my $parent = dirname $subject;
-		if (!chdir $parent)
-		{
-			$leaf   = '/' . basename($parent) . $leaf;
-			$parent = dirname $parent;
-			chdir $parent or die "could not chdir \"$parent\": $!";
-		}
-	}
-
-	# this odd way of calling 'pwd -W' is the only way that seems to work.
-	my $dir = qx{sh -c "pwd -W"};
-	chomp $dir;
-	$dir =~ s!/$!!;
-	chdir $here;
-	return $dir . $leaf;
+	return
+	     $Config{osname} eq 'linux'
+	  && $Config{archname} =~ /^sparc/
+	  && !run_log([ qw(df -x ext4), $tmp_check ], '>', '/dev/null', '2>&1');
 }
 
 =pod
@@ -414,10 +389,39 @@ sub run_command
 	my ($cmd) = @_;
 	my ($stdout, $stderr);
 	my $result = IPC::Run::run $cmd, '>', \$stdout, '2>', \$stderr;
-	foreach ($stderr, $stdout) { s/\r\n/\n/g if $Config{osname} eq 'msys'; }
 	chomp($stdout);
 	chomp($stderr);
 	return ($stdout, $stderr);
+}
+
+=pod
+
+=item pump_until(proc, timeout, stream, until)
+
+Pump until string is matched on the specified stream, or timeout occurs.
+
+=cut
+
+sub pump_until
+{
+	my ($proc, $timeout, $stream, $until) = @_;
+	$proc->pump_nb();
+	while (1)
+	{
+		last if $$stream =~ /$until/;
+		if ($timeout->is_expired)
+		{
+			diag("pump_until: timeout expired when searching for \"$until\" with stream: \"$$stream\"");
+			return 0;
+		}
+		if (not $proc->pumpable())
+		{
+			diag("pump_until: process terminated unexpectedly when searching for \"$until\" with stream: \"$$stream\"");
+			return 0;
+		}
+		$proc->pump();
+	}
+	return 1;
 }
 
 =pod
@@ -472,34 +476,33 @@ sub slurp_file
 	my ($filename, $offset) = @_;
 	local $/;
 	my $contents;
+	my $fh;
+
+	# On windows open file using win32 APIs, to allow us to set the
+	# FILE_SHARE_DELETE flag ("d" below), otherwise other accesses to the file
+	# may fail.
 	if ($Config{osname} ne 'MSWin32')
 	{
-		open(my $in, '<', $filename)
+		open($fh, '<', $filename)
 		  or croak "could not read \"$filename\": $!";
-		if (defined($offset))
-		{
-			seek($in, $offset, SEEK_SET)
-			  or croak "could not seek \"$filename\": $!";
-		}
-		$contents = <$in>;
-		close $in;
 	}
 	else
 	{
 		my $fHandle = createFile($filename, "r", "rwd")
 		  or croak "could not open \"$filename\": $^E";
-		OsFHandleOpen(my $fh = IO::Handle->new(), $fHandle, 'r')
+		OsFHandleOpen($fh = IO::Handle->new(), $fHandle, 'r')
 		  or croak "could not read \"$filename\": $^E\n";
-		if (defined($offset))
-		{
-			setFilePointer($fh, $offset, qw(FILE_BEGIN))
-			  or croak "could not seek \"$filename\": $^E\n";
-		}
-		$contents = <$fh>;
-		CloseHandle($fHandle)
-		  or croak "could not close \"$filename\": $^E\n";
 	}
-	$contents =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
+
+	if (defined($offset))
+	{
+		seek($fh, $offset, SEEK_SET)
+		  or croak "could not seek \"$filename\": $!";
+	}
+
+	$contents = <$fh>;
+	close $fh;
+
 	return $contents;
 }
 
@@ -646,6 +649,46 @@ sub chmod_recursive
 
 =pod
 
+=item scan_server_header(header_path, regexp)
+
+Returns an array that stores all the matches of the given regular expression
+within the PostgreSQL installation's C<header_path>.  This can be used to
+retrieve specific value patterns from the installation's header files.
+
+=cut
+
+sub scan_server_header
+{
+	my ($header_path, $regexp) = @_;
+
+	my ($stdout, $stderr);
+	my $result = IPC::Run::run [ 'pg_config', '--includedir-server' ], '>',
+	  \$stdout, '2>', \$stderr
+	  or die "could not execute pg_config";
+	chomp($stdout);
+	$stdout =~ s/\r$//;
+
+	open my $header_h, '<', "$stdout/$header_path" or die "$!";
+
+	my @match = undef;
+	while (<$header_h>)
+	{
+		my $line = $_;
+
+		if (@match = $line =~ /^$regexp/)
+		{
+			last;
+		}
+	}
+
+	close $header_h;
+	die "could not find match in header $header_path\n"
+	  unless @match;
+	return @match;
+}
+
+=pod
+
 =item check_pg_config(regexp)
 
 Return the number of matches of the given regular expression
@@ -684,8 +727,6 @@ sub dir_symlink
 	my $newname = shift;
 	if ($windows_os)
 	{
-		$oldname = perl2host($oldname);
-		$newname = perl2host($newname);
 		$oldname =~ s,/,\\,g;
 		$newname =~ s,/,\\,g;
 		my $cmd = qq{mklink /j "$newname" "$oldname"};
@@ -759,15 +800,11 @@ sub command_exit_is
 	my $h = IPC::Run::start $cmd;
 	$h->finish();
 
-	# On Windows, the exit status of the process is returned directly as the
-	# process's exit code, while on Unix, it's returned in the high bits
-	# of the exit code (see WEXITSTATUS macro in the standard <sys/wait.h>
-	# header file). IPC::Run's result function always returns exit code >> 8,
-	# assuming the Unix convention, which will always return 0 on Windows as
-	# long as the process was not terminated by an exception. To work around
-	# that, use $h->full_results on Windows instead.
+	# Normally, if the child called exit(N), IPC::Run::result() returns N.  On
+	# Windows, with IPC::Run v20220807.0 and earlier, full_results() is the
+	# method that returns N (https://github.com/toddr/IPC-Run/issues/161).
 	my $result =
-	    ($Config{osname} eq "MSWin32")
+	  ($Config{osname} eq "MSWin32" && $IPC::Run::VERSION <= 20220807.0)
 	  ? ($h->full_results)[0]
 	  : $h->result(0);
 	is($result, $expected, $test_name);
@@ -859,7 +896,6 @@ sub command_like
 	my $result = IPC::Run::run $cmd, '>', \$stdout, '2>', \$stderr;
 	ok($result, "$test_name: exit code 0");
 	is($stderr, '', "$test_name: no stderr");
-	$stdout =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
 	like($stdout, $expected_stdout, "$test_name: matches");
 	return;
 }
@@ -912,7 +948,6 @@ sub command_fails_like
 	print("# Running: " . join(" ", @{$cmd}) . "\n");
 	my $result = IPC::Run::run $cmd, '>', \$stdout, '2>', \$stderr;
 	ok(!$result, "$test_name: exit code not 0");
-	$stderr =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
 	like($stderr, $expected_stderr, "$test_name: matches");
 	return;
 }
@@ -956,8 +991,6 @@ sub command_checks_all
 	die "command exited with signal " . ($ret & 127)
 	  if $ret & 127;
 	$ret = $ret >> 8;
-
-	foreach ($stderr, $stdout) { s/\r\n/\n/g if $Config{osname} eq 'msys'; }
 
 	# check status
 	ok($ret == $expected_ret,

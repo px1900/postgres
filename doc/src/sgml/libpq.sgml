@@ -1388,15 +1388,6 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
       </listitem>
      </varlistentry>
 
-     <varlistentry id="libpq-connect-tty" xreflabel="tty">
-      <term><literal>tty</literal></term>
-      <listitem>
-      <para>
-       Ignored (formerly, this specified where to send server debug output).
-      </para>
-      </listitem>
-     </varlistentry>
-
      <varlistentry id="libpq-connect-replication" xreflabel="replication">
       <term><literal>replication</literal></term>
       <listitem>
@@ -1742,7 +1733,7 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
       <term><literal>sslcrl</literal></term>
       <listitem>
        <para>
-        This parameter specifies the file name of the SSL certificate
+        This parameter specifies the file name of the SSL server certificate
         revocation list (CRL).  Certificates listed in this file, if it
         exists, will be rejected while attempting to authenticate the
         server's certificate.  If neither
@@ -1758,7 +1749,7 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
       <term><literal>sslcrldir</literal></term>
       <listitem>
        <para>
-        This parameter specifies the directory name of the SSL certificate
+        This parameter specifies the directory name of the SSL server certificate
         revocation list (CRL).  Certificates listed in the files in this
         directory, if it exists, will be rejected while attempting to
         authenticate the server's certificate.
@@ -2573,9 +2564,7 @@ const char *PQsslAttribute(const PGconn *conn, const char *attribute_name);
          <term><literal>compression</literal></term>
           <listitem>
            <para>
-            If SSL compression is in use, returns the name of the compression
-            algorithm, or "on" if compression is used but the algorithm is
-            not known. If compression is not in use, returns "off".
+            Returns "on" if SSL compression is in use, else it returns "off".
            </para>
           </listitem>
          </varlistentry>
@@ -4594,6 +4583,11 @@ int PQsendQuery(PGconn *conn, const char *command);
        (on the same connection) until <xref linkend="libpq-PQgetResult"/>
        has returned a null pointer, indicating that the command is done.
       </para>
+
+      <para>
+       In pipeline mode, command strings containing more than one SQL command
+       are disallowed.
+      </para>
      </listitem>
     </varlistentry>
 
@@ -4921,11 +4915,12 @@ int PQsetnonblocking(PGconn *conn, int arg);
       </para>
 
       <para>
-       In the nonblocking state, calls to
+       In the nonblocking state, successful calls to
        <xref linkend="libpq-PQsendQuery"/>, <xref linkend="libpq-PQputline"/>,
        <xref linkend="libpq-PQputnbytes"/>, <xref linkend="libpq-PQputCopyData"/>,
-       and <xref linkend="libpq-PQendcopy"/> will not block but instead return
-       an error if they need to be called again.
+       and <xref linkend="libpq-PQendcopy"/> will not block;  their changes
+       are stored in the local output buffer until they are flushed.
+       Unsuccessful calls will return an error and must be retried.
       </para>
 
       <para>
@@ -5030,10 +5025,11 @@ int PQflush(PGconn *conn);
   </para>
 
   <para>
-   While the pipeline API was introduced in
+   While <application>libpq</application>'s pipeline API was introduced in
    <productname>PostgreSQL</productname> 14, it is a client-side feature
    which doesn't require special server support and works on any server
-   that supports the v3 extended query protocol.
+   that supports the v3 extended query protocol.  For more information see
+   <xref linkend="protocol-flow-pipelining"/>.
   </para>
 
   <sect2 id="libpq-pipeline-using">
@@ -5046,7 +5042,8 @@ int PQflush(PGconn *conn);
     <xref linkend="libpq-PQpipelineStatus"/> can be used
     to test whether pipeline mode is active.
     In pipeline mode, only <link linkend="libpq-async">asynchronous operations</link>
-    are permitted, and <literal>COPY</literal> is disallowed.
+    are permitted, command strings containing multiple SQL commands are
+    disallowed, and so is <literal>COPY</literal>.
     Using synchronous command execution functions
     such as <function>PQfn</function>,
     <function>PQexec</function>,
@@ -7769,9 +7766,11 @@ myEventProc(PGEventId evtId, void *evtInfo, void *passThrough)
        <primary><envar>PGSERVICEFILE</envar></primary>
       </indexterm>
       <envar>PGSERVICEFILE</envar> specifies the name of the per-user
-      connection service file.  If not set, it defaults
-      to <filename>~/.pg_service.conf</filename>
+      connection service file
       (see <xref linkend="libpq-pgservice"/>).
+      Defaults to <filename>~/.pg_service.conf</filename>, or
+      <filename>%APPDATA%\postgresql\.pg_service.conf</filename> on
+      Microsoft Windows.
      </para>
     </listitem>
 
@@ -8071,11 +8070,11 @@ myEventProc(PGEventId evtId, void *evtInfo, void *passThrough)
    The file <filename>.pgpass</filename> in a user's home directory can
    contain passwords to
    be used if the connection requires a password (and no password has been
-   specified  otherwise). On Microsoft Windows the file is named
+   specified otherwise). On Microsoft Windows the file is named
    <filename>%APPDATA%\postgresql\pgpass.conf</filename> (where
    <filename>%APPDATA%</filename> refers to the Application Data subdirectory in
    the user's profile).
-   Alternatively, a password file can be specified
+   Alternatively, the password file to use can be specified
    using the connection parameter <xref linkend="libpq-connect-passfile"/>
    or the environment variable <envar>PGPASSFILE</envar>.
   </para>
@@ -8144,8 +8143,12 @@ myEventProc(PGEventId evtId, void *evtInfo, void *passThrough)
    Service names can be defined in either a per-user service file or a
    system-wide file.  If the same service name exists in both the user
    and the system file, the user file takes precedence.
-   By default, the per-user service file is located
-   at <filename>~/.pg_service.conf</filename>; this can be overridden by
+   By default, the per-user service file is named
+   <filename>~/.pg_service.conf</filename>.
+   On Microsoft Windows, it is named
+   <filename>%APPDATA%\postgresql\.pg_service.conf</filename> (where
+   <filename>%APPDATA%</filename> refers to the Application Data subdirectory
+   in the user's profile).  A different file name can be specified by
    setting the environment variable <envar>PGSERVICEFILE</envar>.
    The system-wide file is named <filename>pg_service.conf</filename>.
    By default it is sought in the <filename>etc</filename> directory
@@ -8368,6 +8371,8 @@ ldap://ldap.acme.com/cn=dbserver,cn=hosts?pgconnectinfo?base?(objectclass=*)
    setting
    the connection parameters <literal>sslrootcert</literal> and <literal>sslcrl</literal>
    or the environment variables <envar>PGSSLROOTCERT</envar> and <envar>PGSSLCRL</envar>.
+   <literal>sslcrldir</literal> or the environment variable <envar>PGSSLCRLDIR</envar>
+   can also be used to specify a directory containing CRL files.
   </para>
 
   <note>
@@ -8389,21 +8394,33 @@ ldap://ldap.acme.com/cn=dbserver,cn=hosts?pgconnectinfo?base?(objectclass=*)
   <para>
    If the server attempts to verify the identity of the
    client by requesting the client's leaf certificate,
-   <application>libpq</application> will send the certificates stored in
+   <application>libpq</application> will send the certificate(s) stored in
    file <filename>~/.postgresql/postgresql.crt</filename> in the user's home
    directory.  The certificates must chain to the root certificate trusted
    by the server.  A matching
    private key file <filename>~/.postgresql/postgresql.key</filename> must also
-   be present. The private
-   key file must not allow any access to world or group; achieve this by the
-   command <command>chmod 0600 ~/.postgresql/postgresql.key</command>.
+   be present.
    On Microsoft Windows these files are named
    <filename>%APPDATA%\postgresql\postgresql.crt</filename> and
-   <filename>%APPDATA%\postgresql\postgresql.key</filename>, and there
-   is no special permissions check since the directory is presumed secure.
+   <filename>%APPDATA%\postgresql\postgresql.key</filename>.
    The location of the certificate and key files can be overridden by the
-   connection parameters <literal>sslcert</literal> and <literal>sslkey</literal> or the
+   connection parameters <literal>sslcert</literal>
+   and <literal>sslkey</literal>, or by the
    environment variables <envar>PGSSLCERT</envar> and <envar>PGSSLKEY</envar>.
+  </para>
+
+  <para>
+   On Unix systems, the permissions on the private key file must disallow
+   any access to world or group; achieve this by a command such as
+   <command>chmod 0600 ~/.postgresql/postgresql.key</command>.
+   Alternatively, the file can be owned by root and have group read access
+   (that is, <literal>0640</literal> permissions).  That setup is intended
+   for installations where certificate and key files are managed by the
+   operating system.  The user of <application>libpq</application> should
+   then be made a member of the group that has access to those certificate
+   and key files.  (On Microsoft Windows, there is no file permissions
+   check, since the <filename>%APPDATA%\postgresql</filename> directory is
+   presumed secure.)
   </para>
 
   <para>
@@ -8676,6 +8693,8 @@ ldap://ldap.acme.com/cn=dbserver,cn=hosts?pgconnectinfo?base?(objectclass=*)
    that the <literal>libssl</literal> and/or <literal>libcrypto</literal> libraries
    have been initialized by your application, so that
    <application>libpq</application> will not also initialize those libraries.
+   However, this is unnecessary when using <productname>OpenSSL</productname>
+   version 1.1.0 or later, as duplicate initializations are no longer problematic.
   </para>
 
   <para>
