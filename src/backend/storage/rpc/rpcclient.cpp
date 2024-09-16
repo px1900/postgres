@@ -426,9 +426,7 @@ int32_t RpcMdExists(SMgrRelation reln, int32_t forknum) {
            reln->smgr_rnode.node.dbNode, reln->smgr_rnode.node.relNode, forknum, GetLogWrtResultLsn());
     fflush(stdout);
 #endif
-    printf("%s End, exist = %d spc=%u, db=%u, rel=%u, forkNum=%d, lsn=%lu\n", __func__, result, reln->smgr_rnode.node.spcNode,
-           reln->smgr_rnode.node.dbNode, reln->smgr_rnode.node.relNode, forknum, GetLogWrtResultLsn());
-    fflush(stdout);
+
 #ifdef DEBUG_TIMING2
     gettimeofday(&end, NULL);
     uint64_t usec = (end.tv_sec + end.tv_usec*1000000) - (start.tv_sec + start.tv_usec*1000000);
@@ -474,9 +472,6 @@ int32_t RpcMdNblocks(SMgrRelation reln, int32_t forknum) {
            reln->smgr_rnode.node.dbNode, reln->smgr_rnode.node.relNode, forknum, GetLogWrtResultLsn());
     fflush(stdout);
 #endif
-    printf("%s End, result = %d,  spc=%u, db=%u, rel=%u, forkNum=%d, lsn=%lu\n", __func__,  result, reln->smgr_rnode.node.spcNode,
-           reln->smgr_rnode.node.dbNode, reln->smgr_rnode.node.relNode, forknum, GetLogWrtResultLsn());
-    fflush(stdout);
 
 #ifdef DEBUG_TIMING2
     gettimeofday(&end, NULL);
@@ -523,9 +518,7 @@ void RpcMdCreate(SMgrRelation reln, int32_t forknum, int32_t isRedo) {
            reln->smgr_rnode.node.dbNode, reln->smgr_rnode.node.relNode, forknum, GetLogWrtResultLsn());
     fflush(stdout);
 #endif
-    printf("%s End, spc=%u, db=%u, rel=%u, forkNum=%d, lsn=%lu\n", __func__, reln->smgr_rnode.node.spcNode,
-           reln->smgr_rnode.node.dbNode, reln->smgr_rnode.node.relNode, forknum, GetLogWrtResultLsn());
-    fflush(stdout);
+ 
 #ifdef DEBUG_TIMING2
     gettimeofday(&end, NULL);
     uint64_t usec = (end.tv_sec + end.tv_usec*1000000) - (start.tv_sec + start.tv_usec*1000000);
@@ -813,7 +806,6 @@ int64_t RpcFileSize(const int _fd) {
     //rpctransport->open();
     result = client->RpcFileSize(_fd);
     //rpctransport->close();
-   printf("[%s] function end %d , result = %d , fd = %d\n", __func__ , getpid(), result, _fd);
 #ifdef DEBUG_TIMING
     gettimeofday(&end, NULL);
     uint64_t usec = (end.tv_sec + end.tv_usec*1000000) - (start.tv_sec + start.tv_usec*1000000);

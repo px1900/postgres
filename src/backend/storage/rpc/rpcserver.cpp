@@ -302,8 +302,8 @@ void xlog_msg_writer(uint8_t **buf, void *context)
 {
         // write a flag 'w' into buf
 
-        printf("%s %d\n", __func__, __LINE__);
-        fflush(stdout);
+        // printf("%s %d\n", __func__, __LINE__);
+        // fflush(stdout);
 
         *(*buf)++ = 'w';
 
@@ -314,8 +314,8 @@ void xlog_msg_writer(uint8_t **buf, void *context)
         uint64_t dataSize = data->dataSize;
         const char *xlogBody = data->xlogBody;
 
-        printf("%s %d\n", __func__, __LINE__);
-        fflush(stdout);
+        // printf("%s %d\n", __func__, __LINE__);
+        // fflush(stdout);
 
         walStart = htonll(walStart);
         walEnd = htonll(walEnd);
@@ -328,14 +328,13 @@ void xlog_msg_writer(uint8_t **buf, void *context)
         memcpy(*buf, &timeStamp, sizeof(timeStamp));
         *buf += sizeof(timeStamp);
 
-        printf("%s %d, dataSize = %lu, startLSN = %lu, startLSN_network = %lu, sizeof(walStart) =%lu\n", __func__, __LINE__, dataSize, data->walStart, walStart, sizeof(walStart));
-        fflush(stdout);
+        // printf("%s %d, dataSize = %lu, startLSN = %lu, startLSN_network = %lu, sizeof(walStart) =%lu\n", __func__, __LINE__, dataSize, data->walStart, walStart, sizeof(walStart)); fflush(stdout);
 
         memcpy(*buf, xlogBody, dataSize);
         *buf += dataSize;
 
-        printf("%s %d\n", __func__, __LINE__);
-        fflush(stdout);
+        // printf("%s %d\n", __func__, __LINE__);
+        // fflush(stdout);
 }
 
 void rel_exists_msg_writer(uint8_t **buf, void *context) {
@@ -503,7 +502,7 @@ void prepare_pageserver_query_init(uint8_t **buffer, const char *tenantId, const
         *buffer += 1;
 
         write_body(buffer, pageserver_query_init_writer, context);
-        printf("Prepared PageServerQueryInit message.\n");
+        // printf("Prepared PageServerQueryInit message.\n");
 }
 
 void prepare_rel_exists_msg(uint8_t **buffer, uint64_t requestLsn, uint64_t notModifiedSinceLsn, uint32_t spcId, uint32_t dbId, uint32_t relId, uint8_t forkNum)
@@ -513,7 +512,7 @@ void prepare_rel_exists_msg(uint8_t **buffer, uint64_t requestLsn, uint64_t notM
         *buffer += 1;
 
         write_body(buffer, rel_exists_msg_writer, &data);
-        printf("Prepared RelExists message.\n");
+        // printf("Prepared RelExists message.\n");
 }
 
 void prepare_nblocks_msg(uint8_t **buffer, uint64_t requestLsn, uint64_t notModifiedSinceLsn, uint32_t spcId, uint32_t dbId, uint32_t relId, uint8_t forkNum)
@@ -523,7 +522,7 @@ void prepare_nblocks_msg(uint8_t **buffer, uint64_t requestLsn, uint64_t notModi
         *buffer += 1;
 
         write_body(buffer, nblocks_msg_writer, &data);
-        printf("Prepared NBlocks message.\n");
+        // printf("Prepared NBlocks message.\n");
 }
 
 void prepare_get_page_query(uint8_t **buffer, uint64_t requestLsn, uint64_t notModifiedSinceLsn, uint32_t spcId, uint32_t dbId, uint32_t relId, uint8_t forkNum, uint32_t blockNum)
@@ -533,7 +532,7 @@ void prepare_get_page_query(uint8_t **buffer, uint64_t requestLsn, uint64_t notM
         *buffer += 1;
 
         write_body(buffer, get_page_msg_writer, &data);
-        printf("Prepared GetPage message.\n");
+        // printf("Prepared GetPage message.\n");
 }
 
 void prepare_xlog_msg(uint8_t **buffer, uint64_t walStart, uint64_t walEnd, int64_t timeStamp, uint64_t dataSize, const char *xlogBody)
@@ -542,11 +541,11 @@ void prepare_xlog_msg(uint8_t **buffer, uint64_t walStart, uint64_t walEnd, int6
         **buffer = 'd'; // Write the first type 'd'
         *buffer += 1;
 
-        printf("%s %d\n", __func__, __LINE__);
-        fflush(stdout);
+        // printf("%s %d\n", __func__, __LINE__);
+        // fflush(stdout);
 
         write_body(buffer, xlog_msg_writer, &data);
-        printf("Prepared XLog message.\n");
+        // printf("Prepared XLog message.\n");
 }
 
 void prepare_authentication_ok(uint8_t **buffer)
@@ -555,7 +554,7 @@ void prepare_authentication_ok(uint8_t **buffer)
         *buffer += 1;
         // *(*buffer)++ = 'R';  // Message type identifier for AuthenticationOk
         write_body(buffer, authentication_ok_writer, NULL);
-        printf("Prepared AuthenticationOk message.\n");
+        // printf("Prepared AuthenticationOk message.\n");
 }
 
 void prepare_copy_both_response(uint8_t **buffer)
@@ -563,7 +562,7 @@ void prepare_copy_both_response(uint8_t **buffer)
         **buffer = 'W';
         *buffer += 1;
         write_body(buffer, copy_both_response_writer, NULL);
-        printf("Prepared CopyBothResponse message.\n");
+        // printf("Prepared CopyBothResponse message.\n");
 }
 
 void prepare_parameter_status(uint8_t **buffer, const char *name, const char *value)
@@ -573,14 +572,14 @@ void prepare_parameter_status(uint8_t **buffer, const char *name, const char *va
         **buffer = 'S';
         *buffer += 1;
         write_body(buffer, parameter_status_writer, context);
-        printf("Prepared ParameterStatus (%s: %s) message.\n", name, value);
+        // printf("Prepared ParameterStatus (%s: %s) message.\n", name, value);
 }
 
 void prepare_ready_for_query(uint8_t **buffer)
 {
         *(*buffer)++ = 'Z'; // Message type identifier for ReadyForQuery
         write_body(buffer, ready_for_query_writer, NULL);
-        printf("Prepared ReadyForQuery message.\n");
+        // printf("Prepared ReadyForQuery message.\n");
 }
 
 int establish_socket(int port)
@@ -617,7 +616,7 @@ int establish_socket(int port)
 
 int init_neon_api_socket(int port, char* tenantId, char* timelineId) {
         int sock = establish_socket(port);
-        printf("Connected to the Neon API server on port %d\n", port);
+        // printf("Connected to the Neon API server on port %d\n", port);
 
         uint8_t *buffer = (uint8_t *)malloc(8192); 
         uint8_t *buffer_ptr = buffer;
@@ -637,8 +636,8 @@ int init_neon_api_socket(int port, char* tenantId, char* timelineId) {
             exit(EXIT_FAILURE);
         }
 
-        printf("%s %d, received %d bytes from neon's PageServerQueryInit API\n", __func__, __LINE__, bytes_received);
-        fflush(stdout);
+        // printf("%s %d, received %d bytes from neon's PageServerQueryInit API\n", __func__, __LINE__, bytes_received);
+        // fflush(stdout);
 
         return sock;
 }
@@ -681,17 +680,17 @@ int8_t relexists_from_neon_api(uint64_t requestLsn, uint64_t notModifiedSinceLsn
             close(sock);
             exit(EXIT_FAILURE);
         }
-        printf("%s %d, received %d bytes from neon's RelExists API\n", __func__, __LINE__, bytes_received);
+        // printf("%s %d, received %d bytes from neon's RelExists API\n", __func__, __LINE__, bytes_received);
         pthread_mutex_unlock(&(NeonAccessLock[socket_select]));
 
         // The first byte of the response is the Copy-both message type
         Assert(response[0] == 'd');
-        printf("response type: %c\n", response[0]);
+        // printf("response type: %c\n", response[0]);
         response += 1;
 
         // Then following a u32 value to indicate the value length, which should be 8191
         uint32_t value_length = ntohl(*(uint32_t *)(response));
-        printf("remaining value length: %u\n", value_length);
+        // printf("remaining value length: %u\n", value_length);
         response += 4;
         if(value_length != 6) {
             printf("value_length != 6, content = %s\n", response);
@@ -700,12 +699,12 @@ int8_t relexists_from_neon_api(uint64_t requestLsn, uint64_t notModifiedSinceLsn
 
         // The next 1 byte is the RelExists tag, which should be 'd'
         Assert(response[0] == 100);
-        printf("RelExists tag: %d\n", response[0]);
+        // printf("RelExists tag: %d\n", response[0]);
         response += 1;
 
         // The next 1 byte is the result, which should be 0 or 1
         uint8_t result = response[0];
-        printf("RelExists result: %u\n", result);
+        // printf("RelExists result: %u\n", result);
 
         return result;
 }
@@ -747,17 +746,17 @@ uint32_t nblocks_from_neon_api(uint64_t requestLsn, uint64_t notModifiedSinceLsn
             close(sock);
             exit(EXIT_FAILURE);
         }
-        printf("%s %d, received %d bytes from neon's NBlocks API\n", __func__, __LINE__, bytes_received);
+        // printf("%s %d, received %d bytes from neon's NBlocks API\n", __func__, __LINE__, bytes_received);
         pthread_mutex_unlock(&(NeonAccessLock[socket_select]));
 
         // The first byte of the response is the Copy-both message type
         Assert(response[0] == 'd');
-        printf("response type: %c\n", response[0]);
+        // printf("response type: %c\n", response[0]);
         response += 1;
 
         // Then following a u32 value to indicate the value length, which should be 8191
         uint32_t value_length = ntohl(*(uint32_t *)(response));
-        printf("remaining value length: %u\n", value_length);
+        // printf("remaining value length: %u\n", value_length);
         response += 4;
         if(value_length != 9) {
             printf("value_length != 9, content = %s\n", response);
@@ -766,12 +765,12 @@ uint32_t nblocks_from_neon_api(uint64_t requestLsn, uint64_t notModifiedSinceLsn
 
         // The next 1 byte is the NBlocks tag, which should be 'd'
         Assert(response[0] == 101);
-        printf("NBlocks tag: %d\n", response[0]);
+        // printf("NBlocks tag: %d\n", response[0]);
         response += 1;
 
         // The next 4 bytes is the result, which should be a u32 value
         uint32_t result = ntohl(*(uint32_t *)(response));
-        printf("NBlocks result: %u\n", result);
+        // printf("NBlocks result: %u\n", result);
 
         return result;
 }
@@ -811,7 +810,7 @@ char* get_page_from_neon_api(uint64_t requestLsn, uint64_t notModifiedSinceLsn, 
             close(sock);
             exit(EXIT_FAILURE);
         }
-        printf("%s %d, received %d bytes from neon's GetPage API\n", __func__, __LINE__, bytes_received);
+        // printf("%s %d, received %d bytes from neon's GetPage API\n", __func__, __LINE__, bytes_received);
         pthread_mutex_unlock(&(NeonAccessLock[socket_select]));
 
         uint8_t *response = orig_response;
@@ -822,12 +821,12 @@ char* get_page_from_neon_api(uint64_t requestLsn, uint64_t notModifiedSinceLsn, 
 
         // The first byte of the response is the Copy-both message type
         Assert(response[0] == 'd');
-        printf("response type: %c\n", response[0]);
+        // printf("response type: %c\n", response[0]);
         response += 1;
 
         // Then following a u32 value to indicate the value length, which should be 8197
         uint32_t value_length = ntohl(*(uint32_t *)(response));
-        printf("remaining value length: %u\n", value_length);
+        // printf("remaining value length: %u\n", value_length);
         Assert(value_length == 8197);
         response += 4;
         if(value_length != 8197) {
@@ -837,13 +836,13 @@ char* get_page_from_neon_api(uint64_t requestLsn, uint64_t notModifiedSinceLsn, 
 
         // The next 1 byte is the GetPage tag, which should be 'f'
         Assert(response[0] == 'f');
-        printf("GetPage tag: %c\n", response[0]);
+        // printf("GetPage tag: %c\n", response[0]);
         response += 1;
 
 
         uint8_t *response_str = (uint8_t*) malloc(8192 + 128);
         uint16_t specialSpace = PageGetSpecialSize(response);
-        printf("specialSpace = %u\n", specialSpace);
+        // printf("specialSpace = %u\n", specialSpace);
 
         memcpy(response_str, response, 8192);
         response_str[8192] = '\0';
@@ -884,7 +883,7 @@ int start_server(int port)
                 return -1;
         }
 
-        printf("Listening on port %d...\n", port);
+        // printf("Listening on port %d...\n", port);
 
         // Accept a connection request
         if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addrlen)) < 0)
@@ -894,7 +893,7 @@ int start_server(int port)
                 return -1;
         }
 
-        printf("Connection from %s:%d has been established.\n", inet_ntoa(address.sin_addr), ntohs(address.sin_port));
+        // printf("Connection from %s:%d has been established.\n", inet_ntoa(address.sin_addr), ntohs(address.sin_port));
 
         // Close the server socket as it's no longer needed
         close(server_fd);
@@ -912,16 +911,16 @@ int start_server(int port)
 
         // Extract the first u32
         uint32_t u32_value1 = ntohl(*(uint32_t *)(data));
-        printf("First 4 bytes as u32: %u\n", u32_value1);
+        // printf("First 4 bytes as u32: %u\n", u32_value1);
 
         // Extract the second u32
         uint32_t u32_value2 = ntohl(*(uint32_t *)(data + 4));
-        printf("Second 4 bytes as u32: %u\n", u32_value2);
+        // printf("Second 4 bytes as u32: %u\n", u32_value2);
 
         // Follow the Rust code logic
         uint16_t req_hi = u32_value2 >> 16;
         uint16_t req_lo = u32_value2 & ((1 << 16) - 1);
-        printf("req_hi: %u, req_lo: %u\n", req_hi, req_lo);
+        // printf("req_hi: %u, req_lo: %u\n", req_hi, req_lo);
 
         // Process the rest of the message
         char *msg_str = (char *)(data + 8);
@@ -956,7 +955,7 @@ int start_server(int port)
 
         // Send all prepared messages at once
         send(new_socket, response_buffer, response_ptr - response_buffer, 0);
-        printf("Sent all prepared messages to the client.\n");
+        // printf("Sent all prepared messages to the client.\n");
         fflush(stdout);
 
         free(response_buffer);
@@ -974,19 +973,19 @@ int process_start_replication_cmd(int socket_fd)
         int bytes_received = recv(socket_fd, data, sizeof(data), 0);
 
         // Print the data out
-        printf("Received data len = %d, data = ", bytes_received);
-        for (int i = 0; i < bytes_received; i++)
-        {
-                printf("%c", data[i]);
-        }
-        printf("\n");
+        // printf("Received data len = %d, data = ", bytes_received);
+        // for (int i = 0; i < bytes_received; i++)
+        // {
+                // printf("%c", data[i]);
+        // }
+        // printf("\n");
 
         // data example: "Q)START_REPLICATION PHYSICAL 0/1696948"
         // We would like to extract the LSN value (1696948 in the example)
         char *hexNumber = (char *)data + 34;
-        printf("hexNumber = %s\n", hexNumber);
+        // printf("hexNumber = %s\n", hexNumber);
         NeonStartupLSN = strtoull(hexNumber, NULL, 16);
-        printf("walStart = %llu\n", NeonStartupLSN);
+        // printf("walStart = %llu\n", NeonStartupLSN);
 
         // Prepare the response
         uint8_t *response_buffer = (uint8_t *)malloc(8192);
@@ -995,7 +994,7 @@ int process_start_replication_cmd(int socket_fd)
 
         // Send the response back to client
         send(socket_fd, response_buffer, response_ptr - response_buffer, 0);
-        printf("Sent the start_replication response back to the client.\n");
+        // printf("Sent the start_replication response back to the client.\n");
 
         free(response_buffer);
         return 0;
@@ -1009,15 +1008,15 @@ int send_xlog_to_neon_engine(int socket_fd, uint64_t walStart, uint64_t walEnd, 
         uint8_t *response_ptr = response_buffer;
         prepare_xlog_msg(&response_ptr, walStart, walEnd, timeStamp, dataSize, xlogBody);
 
-        printf("%s %d\n", __func__, __LINE__);
-        fflush(stdout);
+        // printf("%s %d\n", __func__, __LINE__);
+        // fflush(stdout);
 
         // Send the XLog message to the client
         ssize_t msg_len = send(socket_fd, response_buffer, response_ptr - response_buffer, 0);
-        printf("%s %d, have_dataSize = %lu, actual_sentSize = %u\n", __func__, __LINE__, dataSize, msg_len);
-        fflush(stdout);
+        // printf("%s %d, have_dataSize = %lu, actual_sentSize = %u\n", __func__, __LINE__, dataSize, msg_len);
+        // fflush(stdout);
 
-        printf("Sent the XLog message back to the client.\n");
+        // printf("Sent the XLog message back to the client.\n");
 
         free(response_buffer);
         return 0;
@@ -1026,7 +1025,7 @@ int send_xlog_to_neon_engine(int socket_fd, uint64_t walStart, uint64_t walEnd, 
 // endLSN is not included
 void SyncXLogWithNeonUntilLSN(int socketFd, uint64_t startLsn, uint64_t endLsn)
 {
-        printf("%s %d, startLsn = %lu, endLsn = %lu\n", __func__, __LINE__, startLsn, endLsn);
+        // printf("%s %d, startLsn = %lu, endLsn = %lu\n", __func__, __LINE__, startLsn, endLsn);
         uint64_t xlogBufferSize = 8192 * 160;
         char *xlogBuffer = (char *)malloc(xlogBufferSize);
 
@@ -1067,7 +1066,7 @@ void SyncXLogWithNeonUntilLSN(int socketFd, uint64_t startLsn, uint64_t endLsn)
 
 
                 uint64_t segmentOffset = currentLsn % wal_segment_size;
-                printf("%s %d, pg_pread currentLsn = %lu, segmentOffset = %lu, expectedSize = %d\n", __func__, __LINE__, currentLsn, segmentOffset, expectedSize);
+                // printf("%s %d, pg_pread currentLsn = %lu, segmentOffset = %lu, expectedSize = %d\n", __func__, __LINE__, currentLsn, segmentOffset, expectedSize);
                 uint64_t readSize = pg_pread(fd, xlogBuffer, expectedSize, segmentOffset);
                 if (readSize < 0) {
                         printf("%s, Failed to read file\n", __func__);
@@ -1075,7 +1074,7 @@ void SyncXLogWithNeonUntilLSN(int socketFd, uint64_t startLsn, uint64_t endLsn)
                 }
 
                 // Send the XLog message to the Neon
-                printf("%s %d, send xlog to neon engine, startLSN = %lu, endLSN = %lu\n", __func__, __LINE__, currentLsn, currentLsn + readSize);
+                // printf("%s %d, send xlog to neon engine, startLSN = %lu, endLSN = %lu\n", __func__, __LINE__, currentLsn, currentLsn + readSize);
                 send_xlog_to_neon_engine(socketFd, currentLsn, currentLsn + readSize, 0, readSize, xlogBuffer);
 
                 currentLsn += readSize;
@@ -1217,16 +1216,16 @@ public:
                 printf("%s start\n", __func__);
 #endif
 
-                printf("%s %d start, spc = %lu, db = %lu, rel = %lu, fork = %d, blk = %d, lsn = %lu, tid = %d, current_neon_flush_lsn=%lu\n", __func__ , __LINE__,
-                      _reln._spc_node, _reln._db_node, _reln._rel_node, _forknum, _blknum, _lsn, gettid(), NeonFlushedLSN);
-                fflush(stdout);
+                // printf("%s %d start, spc = %lu, db = %lu, rel = %lu, fork = %d, blk = %d, lsn = %lu, tid = %d, current_neon_flush_lsn=%lu\n", __func__ , __LINE__,
+                //       _reln._spc_node, _reln._db_node, _reln._rel_node, _forknum, _blknum, _lsn, gettid(), NeonFlushedLSN);
+                // fflush(stdout);
 
                 // int64_t lsn_latency = 5*8192;
                 int64_t lsn_latency = 0;
 
                 uint8_t relExists = relexists_from_neon_api(_lsn-lsn_latency, _lsn-lsn_latency, _reln._spc_node, _reln._db_node, _reln._rel_node, _forknum);
-                printf("ReadBufferCommon, relExists = %d\n", relExists);
-                fflush(stdout);
+                // printf("ReadBufferCommon, relExists = %d\n", relExists);
+                // fflush(stdout);
 
                 if(relExists == 0) {
                         // Try to get page from RocksDB.
@@ -1257,8 +1256,8 @@ public:
                 char * neon_page = get_page_from_neon_api(_lsn-lsn_latency, _lsn-lsn_latency, _reln._spc_node, _reln._db_node, _reln._rel_node, _forknum, _blknum);
 
                 uint64_t return_lsn = PageGetLSN(neon_page);
-                printf("ReadBufferCommon, return_lsn = %lu\n", return_lsn);
-                fflush(stdout);
+                // printf("ReadBufferCommon, return_lsn = %lu\n", return_lsn);
+                // fflush(stdout);
 
                 _return.assign(neon_page, BLCKSZ);
                 free(neon_page);
@@ -1710,7 +1709,7 @@ public:
                         if (!foundBasePage)
                         {
                                 printf("%s %d, Error: can't find basePage in disk or rocksdb, and there is no lsn to replay\n", __func__, __LINE__);
-                                // fflush(stdout);
+                                fflush(stdout);
                         }
 #ifdef ENABLE_FUNCTION_TIMING
                         functionTiming.RecordTime(__LINE__);
@@ -1962,8 +1961,8 @@ public:
                 //        SyncReplayProcess();
 
                 uint32_t nblocks = nblocks_from_neon_api(_lsn, _lsn, _reln._spc_node, _reln._db_node, _reln._rel_node, _forknum);
-                printf("ReadBufferCommon, nblocks = %u\n", nblocks);
-                fflush(stdout);
+                // printf("ReadBufferCommon, nblocks = %u\n", nblocks);
+                // fflush(stdout);
                 return nblocks;
 #ifdef DEBUG_TIMING
                 struct timeval start, end;
@@ -2127,9 +2126,6 @@ public:
                        _reln._spc_node, _reln._db_node, _reln._rel_node, _forknum, _lsn, gettid());
                 fflush(stdout);
 #endif
-                printf("%s %s %d , spcID = %ld, dbID = %ld, tabID = %ld, fornum = %d, lsn = %lu tid=%d\n", __func__, __FILE__, __LINE__,
-                       _reln._spc_node, _reln._db_node, _reln._rel_node, _forknum, _lsn, gettid());
-                fflush(stdout);
 
                 RelFileNode rnode;
                 rnode.spcNode = _reln._spc_node;
@@ -2175,9 +2171,6 @@ public:
 #ifdef ENABLE_FUNCTION_TIMING
                 FunctionTiming functionTiming(const_cast<char *>(__func__));
 #endif
-       printf("%s %s %d , spcID = %ld, dbID = %ld, tabID = %ld, fornum = %d, blknum = %d lsn = %ld tid=%d\n", __func__ , __FILE__, __LINE__,
-              _reln._spc_node, _reln._db_node, _reln._rel_node, _forknum, _blknum, _lsn, gettid());
-       fflush(stdout);
 #ifdef ENABLE_DEBUG_INFO
                 printf("%s %s %d , spcID = %ld, dbID = %ld, tabID = %ld, fornum = %d, blknum = %d lsn = %ld tid=%d\n", __func__, __FILE__, __LINE__,
                        _reln._spc_node, _reln._db_node, _reln._rel_node, _forknum, _blknum, _lsn, gettid());
@@ -2734,15 +2727,15 @@ public:
 #ifdef INFO_FUNC_START
                 printf("%s start\n", __func__);
 #endif
-                printf("%s start\n", __func__);
+                // printf("%s start\n", __func__);
                 // printf("%s %d, blockNum = %d, start_idx = %d, lsn = %ld, offset = %ld, amount = %d\n", __func__, __LINE__, _blknum, _idx, _lsn, _offset, _amount);
                 // for (int i = 0; i < _blknum; i++)
                 // {
                 //         printf("_xlblocks[%d] = %ld\n", i, _xlblocks[i]);
                 // }
                 // fflush(stdout);
-                printf("%s %d, start lsn = %lu, end lsn = %ld\n", __func__, __LINE__, _lsn, _xlblocks[_blknum - 1]);
-                fflush(stdout);
+                // printf("%s %d, start lsn = %lu, end lsn = %ld\n", __func__, __LINE__, _lsn, _xlblocks[_blknum - 1]);
+                // fflush(stdout);
                 // Your implementation goes here
 #ifdef INFO_FUNC_START
                 printf("%s %d, blockNum = %d, start_idx = %d, lsn = %ld\n", __func__, __LINE__, _blknum, _idx, _lsn);
@@ -2890,7 +2883,7 @@ public:
 
         _File RpcOpenTransientFileUnderPgData(const _Path& _filename, const int32_t _fileflags) {
                 // Your implementation goes here
-                printf("RpcOpenTransientFileUnderPgData\n");
+                // printf("RpcOpenTransientFileUnderPgData\n");
                 char* pgDataPath = getenv("PGDATA");
                 // connect pgDataPath with _filename
                 std::string pgDataPathStr(pgDataPath);
@@ -2902,7 +2895,7 @@ public:
 
         int32_t RpcBasicOpenFileUnderPgData(const _Path& _path, const int32_t _flags) {
                 // Your implementation goes here
-                printf("RpcOpenTransientFileUnderPgData\n");
+                // printf("RpcOpenTransientFileUnderPgData\n");
                 char* pgDataPath = getenv("PGDATA");
                 // connect pgDataPath with _filename
                 std::string pgDataPathStr(pgDataPath);
