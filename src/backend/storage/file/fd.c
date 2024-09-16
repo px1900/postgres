@@ -389,10 +389,40 @@ durable_unlink_rpc_local(const char *fname, int elevel) {
 
 int
 OpenTransientFile_Rpc_Local(const char *fileName, int fileFlags) {
+    printf("%s start , fileName = %s\n", __func__, fileName);
+    fflush(stdout);
     if (IsRpcClient)
         return RpcOpenTransientFile(fileName, fileFlags);
     else
         return OpenTransientFile(fileName, fileFlags);
+}
+
+int
+OpenTransientFileUnderPgData_Rpc_Local(const char *fileName, int fileFlags) {
+    if (IsRpcClient)
+        return RpcOpenTransientFileUnderPgData(fileName, fileFlags);
+    else {
+        char path[MAXPGPATH];
+        char * PGDATA = getenv("PGDATA");
+        snprintf(path, MAXPGPATH, "%s/%s", PGDATA, fileName);
+        printf("%s start , path = %s, DataDir = %s, fileName = %s\n", __func__, path, DataDir, fileName);
+        fflush(stdout);
+        return OpenTransientFile(path, fileFlags);
+    }
+}
+
+int
+BasicOpenFileUnderPgData_Rpc_Local(const char *fileName, int fileFlags) {
+    if (IsRpcClient)
+        return RpcBasicOpenFile(fileName, fileFlags);
+    else {
+        char path[MAXPGPATH];
+        char * PGDATA = getenv("PGDATA");
+        snprintf(path, MAXPGPATH, "%s/%s", PGDATA, fileName);
+        printf("%s start , path = %s, DataDir = %s, fileName = %s\n", __func__, path, DataDir, fileName);
+        fflush(stdout);
+        return BasicOpenFile(path, fileFlags);
+    }
 }
 
 int

@@ -233,6 +233,16 @@ class DataPageAccessHandler : virtual public DataPageAccessIf {
     printf("RpcXLogFileInit\n");
   }
 
+  _File RpcOpenTransientFileUnderPgData(const _Path& _filename, const int32_t _fileflags) {
+    // Your implementation goes here
+    printf("RpcOpenTransientFileUnderPgData\n");
+  }
+
+  int32_t RpcBasicOpenFileUnderPgData(const _Path& _path, const int32_t _flags) {
+    // Your implementation goes here
+    printf("RpcBasicOpenFileUnderPgData\n");
+  }
+
   /**
    * This method has a oneway modifier. That means the client only makes
    * a request and does not listen for any response at all. Oneway methods

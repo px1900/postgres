@@ -49,6 +49,7 @@ extern "C" {
     int32_t RpcPgPWrite(const int _fd, char *p, const int32_t _amount, const int32_t _offset);
     int32_t RpcClose(const int _fd);
     int32_t RpcBasicOpenFile(char *path, int32_t _flags);
+    int32_t RpcBasicOpenFileUnderPgData(char *path, int32_t _flags); 
     int32_t RpcPgFdatasync(const int32_t _fd);
     int32_t RpcPgFsyncNoWritethrough(const int32_t _fd);
     int32_t RpcLseek(const int32_t _fd, const int64_t _offset, const int32_t _flag);
@@ -60,6 +61,7 @@ extern "C" {
     int32_t RpcDurableRenameExcl(const char* oldFname, const char* newFname, const int32_t _elevel);
     int32_t RpcXLogWriteWithPosition(const int _fd, char *p, const int32_t _amount, const int32_t _offset, int startIdx, int blkNum, uint64_t* xlblocks, int xlblocksBufferNum, uint64_t  lsn);
     int RpcXLogFileInit(XLogSegNo logsegno, bool *use_existent, bool use_lock);
+    int RpcOpenTransientFileUnderPgData(const char* filename, const int32_t _fileflags); 
 #ifdef __cplusplus
 }
 #endif

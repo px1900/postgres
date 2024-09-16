@@ -67,7 +67,7 @@ _bt_getbuf_rename(Relation rel, BlockNumber blkno, int access);
 // _bt_getbuf will call _bt_getbuf_rename2() and printf($location)
 Buffer
 _bt_getbuf_rename2(Relation rel, BlockNumber blkno, int access, char* fileName, int line) {
-	printf("_bt_getbuf called at location: %s:%d\n", fileName, line);
+	// printf("_bt_getbuf called at location: %s:%d\n", fileName, line);
 	return _bt_getbuf_rename(rel, blkno, access);
 }
 
@@ -825,9 +825,9 @@ _bt_checkpage(Relation rel, Buffer buf)
 	 * Additionally check that the special area looks sane.
 	 */
 	if (PageGetSpecialSize(page) != MAXALIGN(sizeof(BTPageOpaqueData))) {
-		printf("Report ERROR: %s %d, spc = %lu, db = %lu, rel = %lu, block = %u, page special size = %lu, BTPageOpaqueData size = %lu, page_lsn = %lu\n", __func__, __LINE__,
-		rel->rd_node.spcNode, rel->rd_node.dbNode, rel->rd_node.relNode, BufferGetBlockNumber(buf), PageGetSpecialSize(page), MAXALIGN(sizeof(BTPageOpaqueData)),
-		PageGetLSN(page));
+		// printf("Report ERROR: %s %d, spc = %lu, db = %lu, rel = %lu, block = %u, page special size = %lu, BTPageOpaqueData size = %lu, page_lsn = %lu\n", __func__, __LINE__,
+		// rel->rd_node.spcNode, rel->rd_node.dbNode, rel->rd_node.relNode, BufferGetBlockNumber(buf), PageGetSpecialSize(page), MAXALIGN(sizeof(BTPageOpaqueData)),
+		// PageGetLSN(page));
 
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -896,9 +896,9 @@ _bt_getbuf_rename(Relation rel, BlockNumber blkno, int access)
 		buf = ReadBuffer(rel, blkno);
 		_bt_lockbuf(rel, buf, access);
 
-		printf("%s %d, spc = %lu, db = %lu, rel = %lu\n", 
-		__FILE__, __LINE__, rel->rd_node.spcNode, rel->rd_node.dbNode, rel->rd_node.relNode); 
-		fflush(stdout);
+		// printf("%s %d, spc = %lu, db = %lu, rel = %lu\n", 
+		// __FILE__, __LINE__, rel->rd_node.spcNode, rel->rd_node.dbNode, rel->rd_node.relNode); 
+		// fflush(stdout);
 
 		_bt_checkpage(rel, buf);
 	}
@@ -1045,9 +1045,9 @@ _bt_relandgetbuf(Relation rel, Buffer obuf, BlockNumber blkno, int access)
 	buf = ReleaseAndReadBuffer(obuf, rel, blkno);
 	_bt_lockbuf(rel, buf, access);
 
-	printf("%s %d, spc = %lu, db = %lu, rel = %lu\n", 
-	__FILE__, __LINE__, rel->rd_node.spcNode, rel->rd_node.dbNode, rel->rd_node.relNode); 
-	fflush(stdout);
+	// printf("%s %d, spc = %lu, db = %lu, rel = %lu\n", 
+	// __FILE__, __LINE__, rel->rd_node.spcNode, rel->rd_node.dbNode, rel->rd_node.relNode); 
+	// fflush(stdout);
 
 	_bt_checkpage(rel, buf);
 	return buf;

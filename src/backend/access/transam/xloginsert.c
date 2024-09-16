@@ -453,8 +453,8 @@ XLogInsert(RmgrId rmid, uint8 info)
 //        id = RmgrTable[rmid].rm_identify( info );
 //        printf("%s %d, RM= %s, End lsn = %lu, id = %s\n", __func__, __LINE__, RmgrTable[rmid].rm_name, EndPos, id);
 //        fflush(stdout);
-		printf("%s %d, finish XLogInsert, RM= %s, End lsn = %lu\n", __func__, __LINE__, RmgrTable[rmid].rm_name, EndPos);
-		fflush(stdout);
+		// printf("%s %d, finish XLogInsert, RM= %s, End lsn = %lu\n", __func__, __LINE__, RmgrTable[rmid].rm_name, EndPos);
+		// fflush(stdout);
 		return EndPos;
 	}
 
@@ -486,8 +486,8 @@ XLogInsert(RmgrId rmid, uint8 info)
 //    printf("%s %d, RM= %s, End lsn = %lu, id = %s\n", __func__, __LINE__, RmgrTable[rmid].rm_name, EndPos, id);
 //    fflush(stdout);
 
-	printf("%s %d, finish XLogInsert, RM= %s, End lsn = %lu\n", __func__, __LINE__, RmgrTable[rmid].rm_name, EndPos);
-	fflush(stdout);
+	// printf("%s %d, finish XLogInsert, RM= %s, End lsn = %lu\n", __func__, __LINE__, RmgrTable[rmid].rm_name, EndPos);
+	// fflush(stdout);
     return EndPos;
 }
 

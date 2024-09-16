@@ -1318,7 +1318,7 @@ ResetDecoder(XLogReaderState *state)
 bool
 DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 {
-	printf("%s, %d, start decode the XLog with LSN %lu, xl_info=%d, rmgr_id=%d\n", __func__, __LINE__, state->currRecPtr, record->xl_info& ~XLR_INFO_MASK & 0x70, record->xl_rmid);
+	// printf("%s, %d, start decode the XLog with LSN %lu, xl_info=%d, rmgr_id=%d\n", __func__, __LINE__, state->currRecPtr, record->xl_info& ~XLR_INFO_MASK & 0x70, record->xl_rmid);
 	/*
 	 * read next _size bytes from record buffer, but check for overrun first.
 	 */
@@ -1346,7 +1346,7 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 	ptr = (char *) record;
 	ptr += SizeOfXLogRecord;
 	remaining = record->xl_tot_len - SizeOfXLogRecord;
-	printf("%s, %d, record total length %d, after subtract header %d, the buffer remaining = %u\n", __func__, __LINE__, record->xl_tot_len, SizeOfXLogRecord, remaining);
+	// printf("%s, %d, record total length %d, after subtract header %d, the buffer remaining = %u\n", __func__, __LINE__, record->xl_tot_len, SizeOfXLogRecord, remaining);
 
 	/* Decode the headers */
 	datatotal = 0;
@@ -1356,7 +1356,7 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 
 		if (block_id == XLR_BLOCK_ID_DATA_SHORT)
 		{
-			printf("%s, %d, block_id = %d, XLR_BLOCK_ID_DATA_SHORT\n", __func__, __LINE__, block_id);
+			// printf("%s, %d, block_id = %d, XLR_BLOCK_ID_DATA_SHORT\n", __func__, __LINE__, block_id);
 			/* XLogRecordDataHeaderShort */
 			uint8		main_data_len;
 
@@ -1369,7 +1369,7 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 		}
 		else if (block_id == XLR_BLOCK_ID_DATA_LONG)
 		{
-			printf("%s, %d, block_id = %d, XLR_BLOCK_ID_DATA_LONG\n", __func__, __LINE__, block_id);
+			// printf("%s, %d, block_id = %d, XLR_BLOCK_ID_DATA_LONG\n", __func__, __LINE__, block_id);
 			/* XLogRecordDataHeaderLong */
 			uint32		main_data_len;
 
@@ -1381,17 +1381,17 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 		}
 		else if (block_id == XLR_BLOCK_ID_ORIGIN)
 		{
-			printf("%s, %d, block_id = %d, XLR_BLOCK_ID_ORIGIN\n", __func__, __LINE__, block_id);
+			// printf("%s, %d, block_id = %d, XLR_BLOCK_ID_ORIGIN\n", __func__, __LINE__, block_id);
 			COPY_HEADER_FIELD(&state->record_origin, sizeof(RepOriginId));
 		}
 		else if (block_id == XLR_BLOCK_ID_TOPLEVEL_XID)
 		{
-			printf("%s, %d, block_id = %d, XLR_BLOCK_ID_TOPLEVEL_XID\n", __func__, __LINE__, block_id);
+			// printf("%s, %d, block_id = %d, XLR_BLOCK_ID_TOPLEVEL_XID\n", __func__, __LINE__, block_id);
 			COPY_HEADER_FIELD(&state->toplevel_xid, sizeof(TransactionId));
 		}
 		else if (block_id <= XLR_MAX_BLOCK_ID)
 		{
-			printf("%s, %d, block_id = %d, start processing block\n", __func__, __LINE__, block_id);
+			// printf("%s, %d, block_id = %d, start processing block\n", __func__, __LINE__, block_id);
 			/* XLogRecordBlockHeader */
 			DecodedBkpBlock *blk;
 			uint8		fork_flags;
@@ -1544,8 +1544,8 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 		}
 	}
 
-	printf("%s, %d, datatotal = %d, main_data_len = %d\n", __func__, __LINE__, datatotal, state->main_data_len);
-	fflush(stdout);
+	// printf("%s, %d, datatotal = %d, main_data_len = %d\n", __func__, __LINE__, datatotal, state->main_data_len);
+	// fflush(stdout);
 	if (remaining != datatotal)
 		goto shortdata_err;
 

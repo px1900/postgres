@@ -2797,18 +2797,18 @@ XLogWrite(XLogwrtRqst WriteRqst, bool flexible)
                 // give rpc parameters: start pointer of xlblocks, how many buffers are in xlblocks,
 				// TODO, this write request may not be able to write all pages in one RPC call. So we can't 100% rely on the WriteRqst.Write;
                 if(ispartialpage) {
-					printf("%s %d, (1) send xlog until %lu\n", __func__, __LINE__, WriteRqst.Write);
-					printf("last_iteration = %d, currentIdx = %d, finishing_seg = %d\n",
-						last_iteration, curridx == XLogCtl->XLogCacheBlck, finishing_seg);
-					fflush(stdout);
+					// printf("%s %d, (1) send xlog until %lu\n", __func__, __LINE__, WriteRqst.Write);
+					// printf("last_iteration = %d, currentIdx = %d, finishing_seg = %d\n",
+						// last_iteration, curridx == XLogCtl->XLogCacheBlck, finishing_seg);
+					// fflush(stdout);
                     written = xlog_write_rpc_local(openLogFile, from, nleft, startoffset, startidx, npages, XLogCtl->xlblocks, XLOGbuffers, WriteRqst.Write);
 
 				}
                 else {
-					printf("%s %d, (2) send xlog until %lu\n", __func__, __LINE__, LogwrtResult.Write);
-					printf("last_iteration = %d, currentIdx = %d, finishing_seg = %d\n",
-						last_iteration, curridx == XLogCtl->XLogCacheBlck, finishing_seg);
-					fflush(stdout);
+					// printf("%s %d, (2) send xlog until %lu\n", __func__, __LINE__, LogwrtResult.Write);
+					// printf("last_iteration = %d, currentIdx = %d, finishing_seg = %d\n",
+						// last_iteration, curridx == XLogCtl->XLogCacheBlck, finishing_seg);
+					// fflush(stdout);
                     written = xlog_write_rpc_local(openLogFile, from, nleft, startoffset, startidx, npages, XLogCtl->xlblocks, XLOGbuffers, LogwrtResult.Write);
 
 				}

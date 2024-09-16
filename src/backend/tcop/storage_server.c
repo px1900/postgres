@@ -15,6 +15,7 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogutils.h"
+#include "tcop/storage_server.h"
 #include "catalog/pg_class.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
@@ -50,6 +51,7 @@ extern HashMap pageVersionHashMap;
 extern XLogRecPtr *RpcXlblocks;
 extern char* RpcXLogPages;
 extern pthread_rwlock_t *RpcXLogPagesLocks;
+pthread_mutex_t *NeonAccessLock;
 
 void sigIntHandler(int sig) {
     printf("Start to clean up process\n");
@@ -1832,7 +1834,7 @@ RpcServerMain(int argc, char *argv[],
 //        }
 //    }
 
-
+    NeonAccessLock = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t)*NeonApiSocketNum);
 
     RpcServerLoop();
     proc_exit(0);
