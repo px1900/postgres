@@ -28,6 +28,10 @@
 #ifndef PALLOC_H
 #define PALLOC_H
 
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 /*
  * Type MemoryContextData is declared in nodes/memnodes.h.  Most users
  * of memory allocation should just treat it as an abstract type, so we
@@ -154,5 +158,9 @@ extern char *pchomp(const char *in);
 /* sprintf into a palloc'd buffer --- these are in psprintf.c */
 extern char *psprintf(const char *fmt,...) pg_attribute_printf(1, 2);
 extern size_t pvsnprintf(char *buf, size_t len, const char *fmt, va_list args) pg_attribute_printf(3, 0);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif							/* PALLOC_H */

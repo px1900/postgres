@@ -676,6 +676,8 @@ ApplyXlogUntil(StringInfo input_message) {
         else
             recoveryTargetTLI = controlFile->checkPointCopy.ThisTimeLineID;
 
+        pfree(controlFile);
+
         ThisTimeLineID = recoveryTargetTLI;
 #ifdef ENABLE_DEBUG_INFO
         printf("%s %d %d, set initial readpoint as %ld, set the recoveryTargetTLI as %d\n", __func__ , __LINE__, ReplayProcessNum,controlFile->checkPoint, recoveryTargetTLI);

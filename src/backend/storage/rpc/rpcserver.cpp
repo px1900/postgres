@@ -20,6 +20,8 @@
 #include <thrift/concurrency/ThreadManager.h>
 #include "storage/fd.h"
 #include "commands/tablespace.h"
+#include "common/controldata_utils.h"
+#include "catalog/pg_control.h"
 #include "storage/rpcserver.h"
 #include "storage/bufmgr.h"
 #include <sys/stat.h>
@@ -27,6 +29,7 @@
 #include "storage/md.h"
 #include "catalog/catalog.h"
 #include "utils/relcache.h"
+#include "utils/palloc.h"
 #include "storage/smgr.h"
 #include "utils/rel.h"
 #include "tcop/storage_server.h"
@@ -44,6 +47,8 @@
 
 #define NeonApiPort 64000
 
+#define LsnLatency (128)
+
 extern HashMap pageVersionHashMap;
 
 extern int reachXlogTempEnd;
@@ -58,6 +63,7 @@ extern uint64_t RpcXLogFlushedLsn;
 int neon_socket;
 int neon_api_socket[NeonApiSocketNum];
 unsigned long long NeonStartupLSN;
+unsigned long long AuroraStartupLSN;
 int NeonCachedUp = 0;
 unsigned long long NeonFlushedLSN = -1;
 extern pthread_mutex_t *NeonAccessLock;
@@ -622,6 +628,9 @@ int init_neon_api_socket(int port, char* tenantId, char* timelineId) {
         uint8_t *buffer_ptr = buffer;
         prepare_pageserver_query_init(&buffer, tenantId, timelineId);
 
+        printf("Prepared PageServerQueryInit message = %s\n", buffer_ptr);
+        fflush(stdout);
+
         // Send the message to the server
         send(sock, buffer_ptr, buffer - buffer_ptr, 0);
 
@@ -643,6 +652,8 @@ int init_neon_api_socket(int port, char* tenantId, char* timelineId) {
 }
 
 int8_t relexists_from_neon_api(uint64_t requestLsn, uint64_t notModifiedSinceLsn, uint32_t spcId, uint32_t dbId, uint32_t relId, uint8_t forkNum) {
+        requestLsn = requestLsn - LsnLatency;
+        notModifiedSinceLsn = notModifiedSinceLsn - LsnLatency;
 
         int tid = gettid();
         int socket_select = tid%NeonApiSocketNum;
@@ -710,6 +721,9 @@ int8_t relexists_from_neon_api(uint64_t requestLsn, uint64_t notModifiedSinceLsn
 }
 
 uint32_t nblocks_from_neon_api(uint64_t requestLsn, uint64_t notModifiedSinceLsn, uint32_t spcId, uint32_t dbId, uint32_t relId, uint8_t forkNum) {
+        requestLsn = requestLsn - LsnLatency;
+        notModifiedSinceLsn = notModifiedSinceLsn - LsnLatency;
+
         int tid = gettid();
         int socket_select = tid%NeonApiSocketNum;
         int gotLock = 0;
@@ -776,6 +790,9 @@ uint32_t nblocks_from_neon_api(uint64_t requestLsn, uint64_t notModifiedSinceLsn
 }
 
 char* get_page_from_neon_api(uint64_t requestLsn, uint64_t notModifiedSinceLsn, uint32_t spcId, uint32_t dbId, uint32_t relId, uint8_t forkNum, uint32_t blockNum) {
+        requestLsn = requestLsn - LsnLatency;
+        notModifiedSinceLsn = notModifiedSinceLsn - LsnLatency;
+
         int tid = gettid();
         int socket_select = tid%NeonApiSocketNum;
         int gotLock = 0;
@@ -963,6 +980,31 @@ int start_server(int port)
         return new_socket;
 }
 
+void* process_neon_xlog_resp(void* arg)
+{
+        printf("process xlog response thread started\n");
+        fflush(stdout);
+        // Read from the socket_fd, and print the response
+        uint8_t data[8192];
+        int data_len = 0;
+        do{
+                data_len = recv(neon_socket, data, sizeof(data), 0);
+                if(data_len > 0) {
+                        // Print the data out
+                        printf("RpcServer received xlog data from Neon engine, len = %d, data = ", data_len);
+                        for (int i = 0; i < data_len; i++)
+                        {
+                                printf("%c", data[i]);
+                        }
+                        printf("\n");
+                        fflush(stdout);
+                }
+        } while(data_len > 0);
+        printf("process xlog response thread ended\n");
+
+        return NULL;
+}
+
 // Receive msg from socket and print them out
 // Use prepare_copy_both_response to prepare the response
 // Send the response back to client
@@ -973,19 +1015,37 @@ int process_start_replication_cmd(int socket_fd)
         int bytes_received = recv(socket_fd, data, sizeof(data), 0);
 
         // Print the data out
-        // printf("Received data len = %d, data = ", bytes_received);
-        // for (int i = 0; i < bytes_received; i++)
-        // {
-                // printf("%c", data[i]);
-        // }
-        // printf("\n");
+        printf("RpcServer received replication cmd data from Neon engine, len = %d, data = ", bytes_received);
+        for (int i = 0; i < bytes_received; i++)
+        {
+                printf("%c", data[i]);
+        }
+        printf("\n");
 
+        std::string part1, part2;
+        std::string rep_str = std::string((char *)data+7);
         // data example: "Q)START_REPLICATION PHYSICAL 0/1696948"
-        // We would like to extract the LSN value (1696948 in the example)
-        char *hexNumber = (char *)data + 34;
-        // printf("hexNumber = %s\n", hexNumber);
-        NeonStartupLSN = strtoull(hexNumber, NULL, 16);
-        // printf("walStart = %llu\n", NeonStartupLSN);
+        // Find the position of the slash (/) in the string
+        size_t slashPos = rep_str.find('/');
+        if (slashPos != std::string::npos) {
+                // Extract the part after the space before the slash (0 in this case)
+                size_t spacePos = rep_str.find_last_of(' ', slashPos);
+                part1 = rep_str.substr(spacePos + 1, slashPos - spacePos - 1);
+        
+                // Extract the part after the slash (1696948 in this case)
+                part2 = rep_str.substr(slashPos + 1);
+        } else {
+                printf("Invalid replication command format\n");
+        }
+
+
+        // Convert the lower_part to uint64_t
+        uint64_t NeonStartupLSN_low = strtoull(part2.c_str(), NULL, 16);
+        // Convert the upper_part to uint64_t
+        uint64_t NeonStartupLSN_high = strtoull(part1.c_str(), NULL, 16);
+
+        NeonStartupLSN = (NeonStartupLSN_high << 32) | NeonStartupLSN_low;
+        printf("NeonStartupLSN = %lu\n", NeonStartupLSN);
 
         // Prepare the response
         uint8_t *response_buffer = (uint8_t *)malloc(8192);
@@ -1013,12 +1073,28 @@ int send_xlog_to_neon_engine(int socket_fd, uint64_t walStart, uint64_t walEnd, 
 
         // Send the XLog message to the client
         ssize_t msg_len = send(socket_fd, response_buffer, response_ptr - response_buffer, 0);
+        if(msg_len != response_ptr - response_buffer) {
+                printf("Failed to send the XLog message back to the client.\n");
+                return -1;
+        }
         // printf("%s %d, have_dataSize = %lu, actual_sentSize = %u\n", __func__, __LINE__, dataSize, msg_len);
         // fflush(stdout);
 
         // printf("Sent the XLog message back to the client.\n");
 
         free(response_buffer);
+
+        // Read from the socket_fd, and print the response
+        // uint8_t data[8192];
+        // int bytes_received = recv(socket_fd, data, sizeof(data), 0);
+
+        // // Print the data out
+        // printf("%s, RpcServer received xlog data from Neon engine, len = %d, data = ", __func__, bytes_received);
+        // for(int i = 0; i < bytes_received; i++) {
+        //         printf("%c", data[i]);
+        // }
+        // printf("\n");
+
         return 0;
 }
 
@@ -1026,7 +1102,7 @@ int send_xlog_to_neon_engine(int socket_fd, uint64_t walStart, uint64_t walEnd, 
 void SyncXLogWithNeonUntilLSN(int socketFd, uint64_t startLsn, uint64_t endLsn)
 {
         // printf("%s %d, startLsn = %lu, endLsn = %lu\n", __func__, __LINE__, startLsn, endLsn);
-        uint64_t xlogBufferSize = 8192 * 160;
+        uint64_t xlogBufferSize = 8192 * 1600;
         char *xlogBuffer = (char *)malloc(xlogBufferSize);
 
         uint64_t currentLsn = startLsn;
@@ -1074,7 +1150,7 @@ void SyncXLogWithNeonUntilLSN(int socketFd, uint64_t startLsn, uint64_t endLsn)
                 }
 
                 // Send the XLog message to the Neon
-                // printf("%s %d, send xlog to neon engine, startLSN = %lu, endLSN = %lu\n", __func__, __LINE__, currentLsn, currentLsn + readSize);
+                printf("%s %d, send xlog to neon engine, startLSN = %lu, endLSN = %lu\n", __func__, __LINE__, currentLsn, currentLsn + readSize);
                 send_xlog_to_neon_engine(socketFd, currentLsn, currentLsn + readSize, 0, readSize, xlogBuffer);
 
                 currentLsn += readSize;
@@ -1220,10 +1296,8 @@ public:
                 //       _reln._spc_node, _reln._db_node, _reln._rel_node, _forknum, _blknum, _lsn, gettid(), NeonFlushedLSN);
                 // fflush(stdout);
 
-                // int64_t lsn_latency = 5*8192;
-                int64_t lsn_latency = 0;
 
-                uint8_t relExists = relexists_from_neon_api(_lsn-lsn_latency, _lsn-lsn_latency, _reln._spc_node, _reln._db_node, _reln._rel_node, _forknum);
+                uint8_t relExists = relexists_from_neon_api(_lsn, _lsn, _reln._spc_node, _reln._db_node, _reln._rel_node, _forknum);
                 // printf("ReadBufferCommon, relExists = %d\n", relExists);
                 // fflush(stdout);
 
@@ -1253,7 +1327,7 @@ public:
                 // printf("ReadBufferCommon, nblocks = %u\n", nblocks);
                 // fflush(stdout);
 
-                char * neon_page = get_page_from_neon_api(_lsn-lsn_latency, _lsn-lsn_latency, _reln._spc_node, _reln._db_node, _reln._rel_node, _forknum, _blknum);
+                char * neon_page = get_page_from_neon_api(_lsn, _lsn, _reln._spc_node, _reln._db_node, _reln._rel_node, _forknum, _blknum);
 
                 uint64_t return_lsn = PageGetLSN(neon_page);
                 // printf("ReadBufferCommon, return_lsn = %lu\n", return_lsn);
@@ -2783,17 +2857,17 @@ public:
                 // fflush(stdout);
 
                 // Before we start sending the new xlogs, we should check whether the Neon cached up with our server
-                if(!NeonCachedUp) {
-                        NeonCachedUp = 1;
+                // if(!NeonCachedUp) {
+                //         NeonCachedUp = 1;
 
-                        int64_t segmentStartLSN = RpcXlblocks[_idx % XLOGbuffers] - RpcXlblocks[_idx % XLOGbuffers] % wal_segment_size;
-                        NeonFlushedLSN = segmentStartLSN + _offset;
-                        if(NeonStartupLSN < NeonFlushedLSN) {
-                                SyncXLogWithNeonUntilLSN(neon_socket, NeonStartupLSN, NeonFlushedLSN);
-                        } else {
-                                NeonFlushedLSN = NeonStartupLSN;
-                        }
-                }
+                //         int64_t segmentStartLSN = RpcXlblocks[_idx % XLOGbuffers] - RpcXlblocks[_idx % XLOGbuffers] % wal_segment_size;
+                //         NeonFlushedLSN = segmentStartLSN + _offset;
+                //         if(NeonStartupLSN < NeonFlushedLSN) {
+                //                 SyncXLogWithNeonUntilLSN(neon_socket, NeonStartupLSN, NeonFlushedLSN);
+                //         } else {
+                //                 NeonFlushedLSN = NeonStartupLSN;
+                //         }
+                // }
 
                 // _page is a pointer, points to the start of the page that xlogWriteStartLSN exists
                 // So, the xlogWriteStartLSN need a offset
@@ -2811,6 +2885,7 @@ public:
                 if (xlogWriteEndLSN > NeonFlushedLSN)
                 {
                         send_xlog_to_neon_engine(neon_socket, NeonFlushedLSN, xlogWriteEndLSN, 0, xlogWriteEndLSN-NeonFlushedLSN, _page.c_str() + pageOffset);
+                        printf("Send xlog to Neon, start = %lu, end = %lu\n", NeonFlushedLSN, xlogWriteEndLSN);
 
                         NeonFlushedLSN = xlogWriteEndLSN;
                         // if (xlogWriteStartLSN >= NeonStartupLSN)
@@ -2927,18 +3002,52 @@ void RpcServerLoop(void)
                 printf("Neon Server started on port %d\n", NeonListenPort);
         }
 
+        char* tenant_id = getenv("tenant_id");
+        char* timeline_id = getenv("timeline_id");
+        printf("tenant_id = %s, timeline_id = %s\n", tenant_id, timeline_id);
+        fflush(stdout);
+
         for (int i = 0; i < NeonApiSocketNum; i++) {
                 pthread_mutex_init(&(NeonAccessLock[i]), NULL);
                 printf("NeonAccessLock[%d] initialized\n", i);
                 fflush(stdout);
 
-                neon_api_socket[i] = init_neon_api_socket(NeonApiPort, "fe705bb4743223a63ec8690f20b2e518", "4d285e6c0aea3f18c41e219cf2bab4e7");
+                neon_api_socket[i] = init_neon_api_socket(NeonApiPort, tenant_id, timeline_id);
                 printf("Connected with server started on port %d\n", NeonApiPort);
                 fflush(stdout);
         }
         // Initialize NeonAccessLock
 
         process_start_replication_cmd(neon_socket);
+
+        char* pgDataPath = getenv("PGDATA");
+        bool crcOk = false;
+        ControlFileData *controlFileData = get_controlfile(pgDataPath, &crcOk);
+        printf("RpcServer got control file's last checkpoint: %lu\n", controlFileData->checkPoint);
+        fflush(stdout);
+        AuroraStartupLSN = controlFileData->checkPoint;
+        pfree(controlFileData);
+
+        // Arise a thread to keep reading from neon_socket
+        // This could make flushing xlog to neon is asynchronous
+        pthread_t neon_xlog_resp_tid = 0;
+        if (pthread_create(&neon_xlog_resp_tid, NULL, process_neon_xlog_resp, NULL) != 0)
+        {
+                printf("Create neon_xlog_resp thread failed\n");
+                fflush(stdout);
+        } else {
+                printf("Create neon_xlog_resp thread success\n");
+                fflush(stdout);
+        }
+
+
+        SyncXLogWithNeonUntilLSN(neon_socket, NeonStartupLSN, AuroraStartupLSN);
+        printf("Neon synced with OpenAurora\n");
+        if(NeonStartupLSN > AuroraStartupLSN) {
+                NeonFlushedLSN = NeonStartupLSN;
+        } else {
+                NeonFlushedLSN = AuroraStartupLSN;
+        }
 
         int port = 9090;
 
