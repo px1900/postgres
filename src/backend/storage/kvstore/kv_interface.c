@@ -88,7 +88,7 @@ void InitKvStore() {
     rocksdb_options_set_compression(options, (int)(cpus));
     rocksdb_options_set_max_successive_merges(options, 1000);
 //    rocksdb_options_set_manual_wal_flush(options, 1);
-    rocksdb_options_set_write_buffer_size(options, (size_t)10*1024*1024*1024);
+    rocksdb_options_set_write_buffer_size(options, (size_t)300*1024*1024);
 
     rocksdb_env_t *options_env = rocksdb_create_default_env();
     rocksdb_env_set_high_priority_background_threads(options_env, (int)(cpus));

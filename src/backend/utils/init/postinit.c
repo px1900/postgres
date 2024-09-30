@@ -581,8 +581,8 @@ void
 InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 			 Oid useroid, char *out_dbname, bool override_allow_connections)
 {
-	printf("%s %d start\n", __func__, __LINE__);
-	fflush(stdout);
+	// printf("%s %d start\n", __func__, __LINE__);
+	// fflush(stdout);
 	bool		bootstrap = IsBootstrapProcessingMode();
 	bool		am_superuser;
 	char	   *fullpath;

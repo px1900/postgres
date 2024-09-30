@@ -104,8 +104,8 @@ static int	on_proc_exit_index,
 void
 proc_exit(int code)
 {
-    printf("%s Start, pid = %d\n", __func__ , getpid());
-    fflush(stdout);
+    // printf("%s Start, pid = %d\n", __func__ , getpid());
+    // fflush(stdout);
     RpcTransportClose();
 	/* not safe if forked by system(), etc. */
 	if (MyProcPid != (int) getpid())

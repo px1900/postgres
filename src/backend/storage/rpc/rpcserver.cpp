@@ -991,13 +991,13 @@ void* process_neon_xlog_resp(void* arg)
                 data_len = recv(neon_socket, data, sizeof(data), 0);
                 if(data_len > 0) {
                         // Print the data out
-                        printf("RpcServer received xlog data from Neon engine, len = %d, data = ", data_len);
-                        for (int i = 0; i < data_len; i++)
-                        {
-                                printf("%c", data[i]);
-                        }
-                        printf("\n");
-                        fflush(stdout);
+                        // printf("RpcServer received xlog data from Neon engine, len = %d, data = ", data_len);
+                        // for (int i = 0; i < data_len; i++)
+                        // {
+                        //         printf("%c", data[i]);
+                        // }
+                        // printf("\n");
+                        // fflush(stdout);
                 }
         } while(data_len > 0);
         printf("process xlog response thread ended\n");
@@ -3007,16 +3007,6 @@ void RpcServerLoop(void)
         printf("tenant_id = %s, timeline_id = %s\n", tenant_id, timeline_id);
         fflush(stdout);
 
-        for (int i = 0; i < NeonApiSocketNum; i++) {
-                pthread_mutex_init(&(NeonAccessLock[i]), NULL);
-                printf("NeonAccessLock[%d] initialized\n", i);
-                fflush(stdout);
-
-                neon_api_socket[i] = init_neon_api_socket(NeonApiPort, tenant_id, timeline_id);
-                printf("Connected with server started on port %d\n", NeonApiPort);
-                fflush(stdout);
-        }
-        // Initialize NeonAccessLock
 
         process_start_replication_cmd(neon_socket);
 
@@ -3047,6 +3037,17 @@ void RpcServerLoop(void)
                 NeonFlushedLSN = NeonStartupLSN;
         } else {
                 NeonFlushedLSN = AuroraStartupLSN;
+        }
+
+        // Initialize NeonAccessLock
+        for (int i = 0; i < NeonApiSocketNum; i++) {
+                pthread_mutex_init(&(NeonAccessLock[i]), NULL);
+                printf("NeonAccessLock[%d] initialized\n", i);
+                fflush(stdout);
+
+                neon_api_socket[i] = init_neon_api_socket(NeonApiPort, tenant_id, timeline_id);
+                printf("Connected with server started on port %d\n", NeonApiPort);
+                fflush(stdout);
         }
 
         int port = 9090;
